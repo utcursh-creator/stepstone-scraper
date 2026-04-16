@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+sessions/
+state/
+screenshots/
+*.png
+*.txt
+!requirements*.txt
+.pytest_cache/
+venv/
+.venv/
+stepstone_cookies.json
+step0_*.py
+step05_*.py
