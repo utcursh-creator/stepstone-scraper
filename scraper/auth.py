@@ -39,6 +39,7 @@ def _is_login_page(url: str) -> bool:
 
 
 async def _dismiss_cookie_banner(page: Page) -> None:
+    """Accept cookie banner + inject CSS to nuke any late-loading variants."""
     for selector in [
         "#ccmgt_explicit_accept",
         "button[data-testid='cookie-accept']",
@@ -51,11 +52,29 @@ async def _dismiss_cookie_banner(page: Page) -> None:
         try:
             btn = await page.query_selector(selector)
             if btn and await btn.is_visible():
-                await btn.click()
-                await human_delay(500, 1000)
-                return
+                try:
+                    await btn.click(force=True, timeout=5000)
+                    await human_delay(500, 1000)
+                except Exception:
+                    pass
         except Exception:
             continue
+    # CSS nuke for any banners that load late (GDPRConsentManagerContainer etc)
+    try:
+        await page.add_style_tag(content="""
+            #GDPRConsentManagerContainer,
+            #GDPRConsentManagerContainer *,
+            .cc-accordion,
+            [class*='consent-manager'],
+            [id*='consent-overlay'] {
+                display: none !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+                opacity: 0 !important;
+            }
+        """)
+    except Exception:
+        pass
 
 
 async def authenticate(

@@ -152,7 +152,12 @@ async def run_scrape(job: JobInput) -> None:
 
             # 4c. Unlock + extract profile
             logger.info(f"Match! Extracting profile {candidate.profile_id}")
-            profile = await extract_profile(page, candidate.profile_id, account_label)
+            profile = await extract_profile(
+                page,
+                candidate.profile_id,
+                account_label,
+                preview_cv_url=getattr(candidate, "cv_url", ""),
+            )
             if profile:
                 profile.matched = True
                 profile.match_confidence = eval_result.confidence

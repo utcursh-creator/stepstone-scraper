@@ -1,124 +1,102 @@
+"""StepStone DirectSearch: search, scrape result cards.
+
+Based on live probing 2026-04-17:
+- Single combined search field: input#searchfield__textfield
+- Submit via Enter key
+- Results are .miniprofile cards (10 per page default)
+- Profile ID extracted from miniprofile__name href query param profileID=XXX
+"""
+import re
+from urllib.parse import urlparse, parse_qs
 from patchright.async_api import Page
 from utils.delays import human_delay
 
 DIRECTSEARCH_URL = "https://www.stepstone.de/5/index.cfm?event=directsearchgen4:searchprofiles"
-RADIUS_STEPS = [25, 50, 75, 100]
 
 
 class SearchResult:
-    def __init__(self, profile_id: str, preview_text: str):
+    def __init__(self, profile_id: str, preview_text: str, profile_url: str = "", cv_url: str = ""):
         self.profile_id = profile_id
         self.preview_text = preview_text
+        self.profile_url = profile_url
+        self.cv_url = cv_url
 
 
-async def _enter_keyword(page: Page, job_title: str) -> None:
-    for selector in [
-        "input[name='searchtext']",
-        "input[placeholder*='Jobtitel']",
-        "input[placeholder*='jobtitel']",
-        "input[placeholder*='Suchbegriff']",
-        "#searchtext",
+async def _kill_cookie_banner(page: Page) -> None:
+    """Accept cookies + inject CSS to permanently hide any late-loading banner."""
+    for sel in [
+        "button:has-text('Alles akzeptieren')",
+        "button:has-text('Alle akzeptieren')",
+        "#onetrust-accept-btn-handler",
     ]:
-        field = await page.query_selector(selector)
-        if field:
-            await field.fill(job_title)
-            await human_delay(500, 1000)
-            return
-    raise RuntimeError("Could not find keyword search field")
-
-
-async def _enter_location(page: Page, location: str) -> None:
-    for selector in [
-        "input[name='location']",
-        "input[placeholder*='Ort']",
-        "input[placeholder*='Stadt']",
-        "#location",
-    ]:
-        field = await page.query_selector(selector)
-        if field:
-            await field.fill("")
-            await human_delay(200, 400)
-            await field.type(location, delay=50)
-            await human_delay(1000, 2000)
-            suggestion = await page.query_selector(
-                ".autocomplete-suggestion, .location-suggestion, [role='option']"
-            )
-            if suggestion:
-                await suggestion.click()
-                await human_delay(300, 600)
-            return
-    raise RuntimeError("Could not find location search field")
-
-
-async def _set_activity_filter(page: Page, days: int = 60) -> None:
+        try:
+            btn = await page.query_selector(sel)
+            if btn and await btn.is_visible():
+                try:
+                    await btn.click(force=True, timeout=5000)
+                    await human_delay(800, 1500)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     try:
-        filter_field = await page.query_selector(
-            "input[name*='activity'], input[name*='seit'], select[name*='activity']"
-        )
-        if filter_field:
-            tag = await filter_field.evaluate("el => el.tagName.toLowerCase()")
-            if tag == "select":
-                await filter_field.select_option(label=f"{days} Tage")
-            await human_delay(300, 600)
+        await page.add_style_tag(content="""
+            #GDPRConsentManagerContainer,
+            #GDPRConsentManagerContainer *,
+            .cc-accordion,
+            [class*='consent-manager'],
+            [id*='consent-overlay'] {
+                display: none !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+                opacity: 0 !important;
+            }
+        """)
     except Exception:
         pass
 
 
-async def _click_search(page: Page) -> None:
-    for selector in [
-        "button[type='submit']",
-        "input[type='submit']",
-        "button:has-text('Suchen')",
-        "button:has-text('Search')",
-        ".search-button",
-    ]:
-        btn = await page.query_selector(selector)
-        if btn:
-            await btn.click()
-            await human_delay(2000, 4000)
-            return
-    await page.keyboard.press("Enter")
-    await human_delay(2000, 4000)
+def _extract_profile_id(href: str) -> str:
+    """Extract profileID query param from a profile link."""
+    if not href:
+        return ""
+    try:
+        parsed = urlparse(href)
+        params = parse_qs(parsed.query)
+        return params.get("profileID", [""])[0]
+    except Exception:
+        return ""
 
 
-async def _get_result_count(page: Page) -> int:
-    for selector in [
-        ".result-count",
-        ".search-results-count",
-        "[data-result-count]",
-        ".resultcount",
-    ]:
-        el = await page.query_selector(selector)
-        if el:
-            text = await el.inner_text()
-            digits = "".join(c for c in text if c.isdigit())
-            if digits:
-                return int(digits)
-    cards = await page.query_selector_all(
-        ".candidate-card, .miniprofile, .search-result-item, tr.result"
-    )
-    return len(cards)
-
-
-async def _scrape_preview_cards(page: Page) -> list[SearchResult]:
-    results = []
-    cards = await page.query_selector_all(
-        ".miniprofile, .candidate-card, .search-result-item, tr.result"
-    )
+async def _scrape_cards(page: Page) -> list[SearchResult]:
+    """Extract candidate cards from the current results page."""
+    results: list[SearchResult] = []
+    cards = await page.query_selector_all(".miniprofile")
     for card in cards:
         try:
-            link = await card.query_selector("a[href*='profile'], a[href*='miniprofile']")
+            # Profile URL + ID from .miniprofile__name link
+            link = await card.query_selector("a.miniprofile__name")
+            profile_url = ""
             profile_id = ""
             if link:
-                href = await link.get_attribute("href") or ""
-                parts = href.split("/")
-                for part in reversed(parts):
-                    if part.isdigit():
-                        profile_id = part
-                        break
-            preview_text = await card.inner_text()
+                profile_url = await link.get_attribute("href") or ""
+                profile_id = _extract_profile_id(profile_url)
+
+            # CV URL from the CV action link
+            cv_url = ""
+            cv_link = await card.query_selector("a.miniprofile__actionlink[href*='downloadAttachment'], a.miniprofile__attachmentdocument")
+            if cv_link:
+                cv_url = await cv_link.get_attribute("href") or ""
+
+            preview_text = (await card.inner_text()).strip()
+
             if profile_id:
-                results.append(SearchResult(profile_id=profile_id, preview_text=preview_text))
+                results.append(SearchResult(
+                    profile_id=profile_id,
+                    preview_text=preview_text,
+                    profile_url=profile_url,
+                    cv_url=cv_url,
+                ))
         except Exception:
             continue
     return results
@@ -129,26 +107,37 @@ async def search_candidates(
     job_title: str,
     location: str,
 ) -> tuple[list[SearchResult], int | None]:
-    """Search DirectSearch for candidates. Returns (results, radius_used).
+    """Search DirectSearch for candidates.
 
-    Tries increasing radius if no results found.
-    Returns empty list with None radius if no candidates at any radius.
+    Uses the combined standard-mode search field. Location is appended to the
+    keyword string; StepStone's backend handles parsing.
+
+    Returns (results, radius_used). Radius is informational only - combined field
+    doesn't expose a discrete radius knob; StepStone uses relevance/proximity by default.
     """
-    await page.goto(DIRECTSEARCH_URL, wait_until="domcontentloaded")
+    await page.goto(DIRECTSEARCH_URL, wait_until="domcontentloaded", timeout=60000)
+    await human_delay(2000, 3500)
+    await _kill_cookie_banner(page)
     await human_delay(1000, 2000)
 
-    for radius in RADIUS_STEPS:
-        await _enter_keyword(page, job_title)
-        await _enter_location(page, location)
-        await _set_activity_filter(page)
-        await _click_search(page)
+    field = await page.query_selector("#searchfield__textfield")
+    if not field:
+        raise RuntimeError("DirectSearch field #searchfield__textfield not found")
 
-        count = await _get_result_count(page)
-        if count > 0:
-            results = await _scrape_preview_cards(page)
-            return results, radius
+    query = f"{job_title} {location}".strip()
+    try:
+        await field.click(force=True, timeout=10000)
+    except Exception:
+        await field.focus()
+    await human_delay(300, 700)
+    await field.fill(query)
+    await human_delay(1000, 2000)
 
-        await page.goto(DIRECTSEARCH_URL, wait_until="domcontentloaded")
-        await human_delay(1000, 2000)
+    # Submit via Enter
+    await field.press("Enter")
+    await human_delay(5000, 7000)
+    await _kill_cookie_banner(page)
 
-    return [], None
+    results = await _scrape_cards(page)
+    radius = 25 if results else None  # informational
+    return results, radius
