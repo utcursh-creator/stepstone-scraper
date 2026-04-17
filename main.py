@@ -101,6 +101,8 @@ async def run_scrape(job: JobInput) -> None:
         logger.info(f"Searching: {job.job_title} in {job.location}")
         candidates, radius = await search_candidates(page, job.job_title, job.location)
         logger.info(f"Found {len(candidates)} candidates (radius: {radius}km)")
+        for c in candidates:
+            logger.info(f"  card {c.profile_id}: preview_text={len(c.preview_text)} chars, cv_url={'yes' if c.cv_url else 'no'}")
 
         if not candidates:
             logger.info("No candidates found at any radius")
@@ -127,6 +129,7 @@ async def run_scrape(job: JobInput) -> None:
                 continue
 
             # 4b. Evaluate with Claude
+            logger.info(f"Evaluating {candidate.profile_id} (preview_text {len(candidate.preview_text)} chars)")
             eval_result = await evaluate_candidate(
                 api_key=settings.openrouter_api_key,
                 candidate_text=candidate.preview_text,
@@ -134,6 +137,7 @@ async def run_scrape(job: JobInput) -> None:
                 location=job.location,
                 requirements=job.requirements,
             )
+            logger.info(f"  eval match={eval_result.match} conf={eval_result.confidence} reason={eval_result.reasoning[:150]}")
             await asyncio.sleep(1.0)  # Rate limit: 1 eval/sec
 
             if not eval_result.match:
