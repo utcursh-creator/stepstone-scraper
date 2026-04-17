@@ -1,0 +1,11 @@
+services:
+  scraper:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./sessions:/app/sessions
+      - ./state:/app/state
+      - ./screenshots:/app/screenshots
+    restart: unless-stopped
