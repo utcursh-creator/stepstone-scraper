@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     scrape_timeout_seconds: int = 1200
     max_candidates_per_job: int = 50
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_accounts(self) -> list[dict]:
         accounts = [

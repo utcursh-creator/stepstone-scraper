@@ -4,7 +4,7 @@ import re
 from patchright.async_api import BrowserContext, Page
 from utils.delays import human_delay
 
-LOGIN_URL = "https://www.stepstone.de/5/index.cfm?event=login"
+LOGIN_URL = "https://www.stepstone.de/5/recruiterspace/login"
 DIRECTSEARCH_URL = "https://www.stepstone.de/5/index.cfm?event=directsearchgen4:searchprofiles"
 
 
@@ -40,14 +40,17 @@ def _is_login_page(url: str) -> bool:
 
 async def _dismiss_cookie_banner(page: Page) -> None:
     for selector in [
+        "#ccmgt_explicit_accept",
         "button[data-testid='cookie-accept']",
         "button:has-text('Alle akzeptieren')",
+        "button:has-text('Alles akzeptieren')",
+        "button:has-text('Akzeptieren')",
         "button:has-text('Accept')",
         "#onetrust-accept-btn-handler",
     ]:
         try:
             btn = await page.query_selector(selector)
-            if btn:
+            if btn and await btn.is_visible():
                 await btn.click()
                 await human_delay(500, 1000)
                 return
@@ -75,7 +78,9 @@ async def authenticate(
         await context.add_cookies(saved_cookies)
         await page.goto(DIRECTSEARCH_URL, wait_until="domcontentloaded")
         await human_delay(1000, 2000)
-        if not _is_login_page(page.url):
+        # Session valid if no login form is present (URL may contain 'login' as substring)
+        has_login_form = await page.query_selector("input[name='username'], input[name='password']") is not None
+        if not has_login_form:
             return  # Session still valid
 
     # 2. Fresh login
@@ -83,22 +88,25 @@ async def authenticate(
     await human_delay(2000, 4000)
     await _dismiss_cookie_banner(page)
 
-    # Find and fill email field
+    # Find and fill email/username field
+    # Recruiter Space uses input[name='username'] (confirmed 2026-04-17)
     email_field = None
     for selector in [
+        "input[name='username']",
         "input[name='login']",
         "input[name='email']",
-        "input[name='username']",
         "input[type='email']",
         "input[id='login']",
     ]:
         email_field = await page.query_selector(selector)
-        if email_field:
+        if email_field and await email_field.is_visible():
             break
+        email_field = None
 
     if not email_field:
+        os.makedirs("screenshots", exist_ok=True)
         await page.screenshot(path="screenshots/login_no_email_field.png")
-        raise AuthenticationError("Could not find email input field on login page")
+        raise AuthenticationError("Could not find username input field on login page")
 
     await email_field.fill(email)
     await human_delay(500, 1500)
@@ -125,12 +133,31 @@ async def authenticate(
         if submit_btn:
             break
 
+    # Hide any late-loading cookie/GDPR banner that may intercept the click
+    await page.evaluate("""
+        (() => {
+            const sels = ['#GDPRConsentManagerContainer', '.cc-accordion', '[id*="consent"]', '[class*="consent-manager"]'];
+            for (const s of sels) {
+                document.querySelectorAll(s).forEach(el => { el.style.display = 'none'; });
+            }
+        })()
+    """)
+    await human_delay(200, 500)
+
     if submit_btn:
-        await submit_btn.click()
+        try:
+            await submit_btn.click(timeout=10000)
+        except Exception:
+            # Fallback: force click ignoring overlays
+            await submit_btn.click(force=True, timeout=10000)
     else:
         await password_field.press("Enter")
 
-    # Wait for navigation
+    # Wait for navigation to complete
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
     await human_delay(3000, 5000)
 
     # 3. CAPTCHA handling (if solver provided)
@@ -146,12 +173,16 @@ async def authenticate(
                     )
                     await human_delay(1000, 2000)
                 except Exception:
-                    pass  # CAPTCHA solving failed, continue anyway
+                    pass
 
-    # 4. Verify login
-    if _is_login_page(page.url):
+    # 4. Verify login - check by absence of login form, not URL substring
+    # (post-login URLs can still contain 'login' as query params or path fragments)
+    still_has_login_form = await page.query_selector("input[name='username']") is not None
+    still_has_login_form = still_has_login_form and await page.query_selector("input[name='password']") is not None
+    if still_has_login_form:
+        os.makedirs("screenshots", exist_ok=True)
         await page.screenshot(path="screenshots/login_failed.png")
-        raise AuthenticationError(f"Login failed for {email} — still on login page")
+        raise AuthenticationError(f"Login failed for {email} - form still visible post-submit")
 
     # 5. Save session
     cookies = await context.cookies()
