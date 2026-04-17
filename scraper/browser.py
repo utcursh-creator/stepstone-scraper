@@ -16,17 +16,21 @@ async def create_browser(
     browser = await p.chromium.launch(
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        proxy={
-            "server": f"http://{proxy_host}:{proxy_port}",
-            "username": f"{proxy_user}_country-{proxy_country}_session-{session_id}",
-            "password": proxy_pass,
-        },
     )
+
+    # IPRoyal format: country and session modifiers go on the PASSWORD, not username.
+    # Format: pass_country-de_session-XXX_lifetime-10m
+    composed_pass = f"{proxy_pass}_country-{proxy_country.lower()}_session-{session_id}_lifetime-10m"
 
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
         locale="de-DE",
         timezone_id="Europe/Berlin",
+        proxy={
+            "server": f"http://{proxy_host}:{proxy_port}",
+            "username": proxy_user,
+            "password": composed_pass,
+        },
     )
 
     page = await context.new_page()
