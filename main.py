@@ -42,8 +42,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="StepStone Scraper", lifespan=lifespan)
 
 
-async def run_scrape(job: JobInput) -> None:
-    """Main scrape orchestrator. Runs as a background task."""
+async def run_scrape(job: JobInput) -> ScrapeResult:
+    """Main scrape orchestrator. Returns ScrapeResult without sending webhook.
+
+    The caller is responsible for sending the webhook AFTER releasing the
+    concurrency lock, so n8n's chain-dispatch doesn't hit a 409.
+    """
     global current_status
     current_status = {"state": "running", "job": job.model_dump(), "error": None}
     accounts = settings.get_accounts()
@@ -83,7 +87,6 @@ async def run_scrape(job: JobInput) -> None:
             logger.info("Authentication successful")
         except AuthenticationError as e:
             logger.error(f"Auth failed for {account['email']}: {e}")
-            # Try next account
             for alt in accounts:
                 if alt["email"] != account["email"]:
                     try:
@@ -103,12 +106,6 @@ async def run_scrape(job: JobInput) -> None:
         logger.info(f"Found {len(candidates)} candidates (radius: {radius}km)")
         for c in candidates:
             logger.info(f"  card {c.profile_id}: preview_text={len(c.preview_text)} chars, cv_url={'yes' if c.cv_url else 'no'}")
-
-        if not candidates:
-            logger.info("No candidates found at any radius")
-            await send_webhook(settings.n8n_webhook_url, result)
-            current_status = {"state": "idle", "job": None, "error": None}
-            return
 
         # 4. Process each candidate
         processed = 0
@@ -184,27 +181,16 @@ async def run_scrape(job: JobInput) -> None:
             processed += 1
             await human_delay(1000, 3000)
 
-        # 5. Send results to n8n
-        logger.info(f"Sending {len(result.candidates)} candidates to webhook")
-        await send_webhook(settings.n8n_webhook_url, result)
-
     except Exception as e:
         logger.error(f"Scrape error: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         result.partial = True
         current_status["error"] = str(e)
-        try:
-            await send_webhook(settings.n8n_webhook_url, result)
-        except Exception:
-            pass
     finally:
         if browser:
             await close_browser(browser)
-        current_status = {
-            "state": "idle",
-            "job": None,
-            "error": current_status.get("error"),
-        }
+
+    return result
 
 
 @app.post("/scrape", status_code=202)
@@ -214,7 +200,15 @@ async def scrape(job: JobInput, background_tasks: BackgroundTasks):
 
     async def locked_scrape():
         async with scrape_lock:
-            await run_scrape(job)
+            result = await run_scrape(job)
+        # Lock released here — n8n's chain-dispatch will now get 202, not 409.
+        current_status["state"] = "idle"
+        current_status["job"] = None
+        logger.info(f"Sending {len(result.candidates)} candidates to webhook")
+        await send_webhook(settings.n8n_webhook_url, result)
+        # Update status with any webhook error (doesn't re-acquire lock)
+        if current_status.get("error") is None:
+            current_status["error"] = None
 
     background_tasks.add_task(locked_scrape)
     return {"status": "accepted", "job_title": job.job_title, "location": job.location}
