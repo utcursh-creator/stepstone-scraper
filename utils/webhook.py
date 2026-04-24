@@ -5,17 +5,28 @@ from models.candidate import ScrapeResult
 
 logger = logging.getLogger(__name__)
 
-# CV-bearing payloads can be 1-5 MB; give the remote side time to persist.
 WEBHOOK_TIMEOUT_SECONDS = 120.0
 
 
 async def send_webhook(url: str, result: ScrapeResult) -> bool:
-    """POST ScrapeResult to n8n webhook. Logs payload size + result."""
+    """POST ScrapeResult to n8n webhook.
+
+    cv_base64 is stripped before serialisation regardless of upstream state —
+    Recruitee direct-upload makes base64 unnecessary in the webhook payload.
+    """
     payload = result.model_dump()
+    # Strip cv_base64 from every candidate: already uploaded to Recruitee,
+    # no need to carry 7 MB of PDF through the webhook.
+    for cand in payload.get("candidates", []):
+        cand["cv_base64"] = None
+
     payload_bytes = len(json.dumps(payload).encode("utf-8"))
     payload_kb = payload_bytes / 1024
     n_cand = len(payload.get("candidates", []))
-    logger.info(f"Webhook POST -> {url}  candidates={n_cand}  payload={payload_kb:.1f} KB  timeout={WEBHOOK_TIMEOUT_SECONDS}s")
+    logger.info(
+        f"Webhook POST -> {url}  candidates={n_cand}  "
+        f"payload={payload_kb:.1f} KB  timeout={WEBHOOK_TIMEOUT_SECONDS}s"
+    )
 
     async with httpx.AsyncClient() as client:
         try:
