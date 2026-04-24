@@ -1,11 +1,18 @@
 import pytest
 import httpx
 import respx
+import utils.recruitee as _recruitee_mod
 from utils.recruitee import create_candidate, upload_cv, set_stage, RecruiteeError
 
 TOKEN = "bearer_test"
 COMPANY = "61932"
 BASE = f"https://api.recruitee.com/c/{COMPANY}"
+
+
+@pytest.fixture(autouse=True)
+def no_retry_sleep(monkeypatch):
+    """Zero out retry backoff so tests don't sleep 2s per attempt."""
+    monkeypatch.setattr(_recruitee_mod, "RETRY_DELAY_SECONDS", 0.0)
 
 
 # -- create_candidate --
