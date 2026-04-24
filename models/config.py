@@ -25,6 +25,10 @@ class Settings(BaseSettings):
 
     twocaptcha_api_key: str = ""
 
+    # Recruitee — used to push candidates directly during scrape
+    recruitee_api_token: str = ""
+    recruitee_company_id: str = "61932"
+
     scrape_timeout_seconds: int = 1200
     max_candidates_per_job: int = 50
 

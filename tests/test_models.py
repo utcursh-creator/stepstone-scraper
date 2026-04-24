@@ -101,3 +101,20 @@ def test_candidate_result_recruitee_populated():
     assert c.recruitee_placement_id == 67890
     assert c.cv_uploaded is True
     assert c.recruitee_status == "stage_set"
+
+
+def test_settings_recruitee_fields(monkeypatch):
+    # Set all required fields
+    for k, v in {
+        "PROXY_HOST": "geo.iproyal.com", "PROXY_PORT": "12321",
+        "PROXY_USER": "user", "PROXY_PASS": "pass", "PROXY_COUNTRY": "DE",
+        "STEPSTONE_EMAIL_1": "a@test.com", "STEPSTONE_PASS_1": "pw1",
+        "OPENROUTER_API_KEY": "sk-test", "AIRTABLE_PAT": "pat_test",
+        "AIRTABLE_BASE_ID": "app_test", "AIRTABLE_CANDIDATES_TABLE": "tbl_test",
+        "AIRTABLE_CREDIT_TABLE": "tbl_test2", "N8N_WEBHOOK_URL": "https://x.com/wh",
+        "RECRUITEE_API_TOKEN": "bearer_test", "RECRUITEE_COMPANY_ID": "61932",
+    }.items():
+        monkeypatch.setenv(k, v)
+    s = Settings()
+    assert s.recruitee_api_token == "bearer_test"
+    assert s.recruitee_company_id == "61932"
