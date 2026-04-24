@@ -1,3 +1,4 @@
+from typing import Literal
 from pydantic import BaseModel, computed_field
 
 
@@ -19,7 +20,7 @@ class CandidateResult(BaseModel):
     recruitee_candidate_id: int | None = None
     recruitee_placement_id: int | None = None
     cv_uploaded: bool = False
-    recruitee_status: str = ""  # "created" | "cv_uploaded" | "stage_set" | "failed" | ""
+    recruitee_status: Literal["", "created", "cv_uploaded", "stage_set", "failed"] = ""
 
 
 class ScrapeResult(BaseModel):
