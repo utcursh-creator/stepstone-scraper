@@ -75,3 +75,29 @@ def test_settings_accounts_parsing(monkeypatch):
     assert len(accounts) == 2
     assert accounts[0]["email"] == "a@test.com"
     assert accounts[1]["email"] == "b@test.com"
+
+
+def test_candidate_result_recruitee_defaults():
+    c = CandidateResult(
+        name="Maria Muster",
+        stepstone_profile_id="99999",
+    )
+    assert c.recruitee_candidate_id is None
+    assert c.recruitee_placement_id is None
+    assert c.cv_uploaded is False
+    assert c.recruitee_status == ""
+
+
+def test_candidate_result_recruitee_populated():
+    c = CandidateResult(
+        name="Maria Muster",
+        stepstone_profile_id="99999",
+        recruitee_candidate_id=12345,
+        recruitee_placement_id=67890,
+        cv_uploaded=True,
+        recruitee_status="stage_set",
+    )
+    assert c.recruitee_candidate_id == 12345
+    assert c.recruitee_placement_id == 67890
+    assert c.cv_uploaded is True
+    assert c.recruitee_status == "stage_set"

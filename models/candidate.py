@@ -15,6 +15,11 @@ class CandidateResult(BaseModel):
     cv_base64: str | None = None
     cv_filename: str = ""
     account_used: str = ""
+    # Recruitee fields — populated after direct upload during scrape
+    recruitee_candidate_id: int | None = None
+    recruitee_placement_id: int | None = None
+    cv_uploaded: bool = False
+    recruitee_status: str = ""  # "created" | "cv_uploaded" | "stage_set" | "failed" | ""
 
 
 class ScrapeResult(BaseModel):
