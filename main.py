@@ -18,6 +18,7 @@ from scraper.rotation import next_account
 from scraper.search import search_candidates
 from utils.delays import human_delay
 from utils.openrouter import evaluate_candidate
+from utils.recruitee import create_candidate, upload_cv, set_stage, RecruiteeError
 from utils.webhook import send_webhook
 
 load_dotenv()
@@ -40,6 +41,77 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="StepStone Scraper", lifespan=lifespan)
+
+
+async def _push_to_recruitee(
+    profile: "CandidateResult",
+    offer_id: int,
+    stage_id: int,
+    token: str,
+    company_id: str,
+) -> None:
+    """Create candidate in Recruitee, upload CV, set Gesourct stage.
+
+    All three steps update profile in-place. Failures are non-fatal:
+    we log errors and set recruitee_status='failed' so n8n can skip
+    the Recruitee steps for this candidate.
+    """
+    # Step 1: Create candidate + link to offer
+    try:
+        candidate_id, placement_id = await create_candidate(
+            token=token,
+            company_id=company_id,
+            name=profile.name,
+            emails=[profile.email] if profile.email else [],
+            phones=[profile.phone] if profile.phone else [],
+            offer_id=offer_id,
+        )
+        profile.recruitee_candidate_id = candidate_id
+        profile.recruitee_placement_id = placement_id
+        profile.recruitee_status = "created"
+    except RecruiteeError as e:
+        logger.error(f"Recruitee create_candidate failed for {profile.stepstone_profile_id}: {e}")
+        profile.recruitee_status = "failed"
+        return  # Skip CV upload and stage set if creation failed
+
+    # Step 2: Upload CV (non-fatal if cv_base64 missing or upload fails)
+    if profile.cv_base64:
+        import base64 as _base64
+        cv_bytes = _base64.b64decode(profile.cv_base64)
+        filename = profile.cv_filename or "CV.pdf"
+        uploaded = await upload_cv(
+            token=token,
+            company_id=company_id,
+            candidate_id=candidate_id,
+            cv_bytes=cv_bytes,
+            filename=filename,
+        )
+        profile.cv_uploaded = uploaded
+        if uploaded:
+            profile.recruitee_status = "cv_uploaded"
+        else:
+            logger.warning(
+                f"CV upload failed for Recruitee candidate {candidate_id}; continuing to stage set"
+            )
+    else:
+        logger.info(
+            f"No cv_base64 for profile {profile.stepstone_profile_id}; skipping CV upload"
+        )
+
+    # Step 3: Set stage (non-fatal)
+    stage_set = await set_stage(
+        token=token,
+        company_id=company_id,
+        placement_id=placement_id,
+        stage_id=stage_id,
+    )
+    if stage_set:
+        profile.recruitee_status = "stage_set"
+    else:
+        logger.warning(
+            f"Stage set failed for placement {placement_id}; "
+            f"status stays {profile.recruitee_status!r}"
+        )
 
 
 async def run_scrape(job: JobInput) -> ScrapeResult:
@@ -163,6 +235,20 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 profile.matched = True
                 profile.match_confidence = eval_result.confidence
                 profile.match_reasoning = eval_result.reasoning
+
+                # 4d. Push to Recruitee (if configured)
+                if settings.recruitee_api_token:
+                    await _push_to_recruitee(
+                        profile=profile,
+                        offer_id=int(job.offer_id),
+                        stage_id=int(job.stage_id),
+                        token=settings.recruitee_api_token,
+                        company_id=settings.recruitee_company_id,
+                    )
+
+                # Strip cv_base64 — uploaded to Recruitee; don't include in webhook.
+                profile.cv_base64 = None
+
                 result.candidates.append(profile)
             else:
                 result.candidates.append(
