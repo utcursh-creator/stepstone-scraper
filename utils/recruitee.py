@@ -81,6 +81,7 @@ async def create_candidate(
             "name": name,
             "emails": emails,
             "phones": phones,
+            "sources": ["StepStone Automation"],
         },
         "offer_ids": [offer_id],  # ROOT level — not inside candidate
     }

@@ -158,3 +158,26 @@ async def test_set_stage_failure_returns_false():
         placement_id=222, stage_id=0,
     )
     assert ok is False
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_candidate_source_tag():
+    """Candidate payload must include sources: ['StepStone Automation']."""
+    route = respx.post(f"{BASE}/candidates").mock(
+        return_value=httpx.Response(
+            201,
+            json={"candidate": {"id": 1, "placements": [{"id": 2}]}},
+        )
+    )
+    await create_candidate(
+        token=TOKEN,
+        company_id=COMPANY,
+        name="Test Candidate",
+        emails=[],
+        phones=[],
+        offer_id=1,
+    )
+    import json as _json
+    body = _json.loads(route.calls[0].request.read())
+    assert body["candidate"]["sources"] == ["StepStone Automation"]
