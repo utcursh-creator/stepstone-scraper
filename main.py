@@ -17,6 +17,13 @@ from scraper.profile import extract_profile
 from scraper.rotation import next_account
 from scraper.search import search_candidates
 from utils.delays import human_delay
+from utils.geocode import (
+    clear_cache,
+    extract_wohnadresse,
+    extract_gewuenschte_arbeitsorte,
+    calculate_distance_km,
+    check_desired_location_match,
+)
 from utils.openrouter import evaluate_candidate
 from utils.recruitee import create_candidate, upload_cv, set_stage, RecruiteeError
 from utils.webhook import send_webhook
@@ -121,6 +128,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     concurrency lock, so n8n's chain-dispatch doesn't hit a 409.
     """
     global current_status
+    clear_cache()  # Reset geocoding cache for this job
     current_status = {"state": "running", "job": job.model_dump(), "error": None}
     accounts = settings.get_accounts()
     account = next_account(accounts, COUNTER_PATH)
@@ -197,7 +205,42 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 logger.info(f"Skipping duplicate: {candidate.profile_id}")
                 continue
 
-            # 4b. Evaluate with Claude
+            # 4b. Distance validation (saves API call + unlock credit)
+            wohnadresse = extract_wohnadresse(candidate.preview_text)
+            gewuenschte_arbeitsorte = extract_gewuenschte_arbeitsorte(candidate.preview_text)
+            distance_km = None
+
+            if wohnadresse:
+                distance_km = calculate_distance_km(wohnadresse, job.location)
+
+            if distance_km is not None and distance_km > job.max_distance_km:
+                desired_match = check_desired_location_match(gewuenschte_arbeitsorte, job.location)
+                if not desired_match:
+                    logger.info(
+                        f"  REJECTED {candidate.profile_id}: "
+                        f"home {wohnadresse} is {distance_km:.0f}km from {job.location} "
+                        f"(max {job.max_distance_km}km, no desired location match)"
+                    )
+                    result.candidates.append(
+                        CandidateResult(
+                            name="",
+                            stepstone_profile_id=candidate.profile_id,
+                            matched=False,
+                            match_confidence=0.0,
+                            match_reasoning=(
+                                f"ABGELEHNT: Wohnadresse {wohnadresse} liegt {distance_km:.0f}km "
+                                f"von {job.location} entfernt (Maximum: {job.max_distance_km}km). "
+                                f"Keine Umzugsbereitschaft erkennbar."
+                            ),
+                            unlocked=False,
+                            unlock_reason="too_far",
+                            account_used=account_label,
+                        )
+                    )
+                    processed += 1
+                    continue
+
+            # 4c. Evaluate with Claude (with factual distance data when available)
             logger.info(f"Evaluating {candidate.profile_id} (preview_text {len(candidate.preview_text)} chars)")
             eval_result = await evaluate_candidate(
                 api_key=settings.openrouter_api_key,
@@ -205,6 +248,10 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 job_title=job.job_title,
                 location=job.location,
                 requirements=job.requirements,
+                distance_km=distance_km,
+                wohnadresse=wohnadresse,
+                gewuenschte_arbeitsorte=gewuenschte_arbeitsorte,
+                max_distance_km=job.max_distance_km,
             )
             logger.info(f"  eval match={eval_result.match} conf={eval_result.confidence} reason={eval_result.reasoning[:150]}")
             await asyncio.sleep(1.0)  # Rate limit: 1 eval/sec
