@@ -19,7 +19,7 @@ EVAL_PROMPT = """You are a German recruitment specialist evaluating candidates f
 JOB TITLE: {job_title}
 JOB LOCATION: {location}
 JOB REQUIREMENTS: {requirements}
-
+{location_context}
 CANDIDATE PREVIEW:
 {candidate_text}
 
@@ -55,18 +55,61 @@ def _extract_json(content: str) -> str:
     return stripped
 
 
+def _build_location_context(
+    distance_km: float | None,
+    wohnadresse: str | None,
+    gewuenschte_arbeitsorte: str | None,
+    job_location: str,
+    max_distance_km: int,
+) -> str:
+    """Build the LOCATION DATA section appended to the evaluation prompt.
+
+    Returns an empty string when distance data is unavailable, so the prompt
+    degrades gracefully to the original behaviour.
+    """
+    if distance_km is None or not wohnadresse:
+        return ""
+    return (
+        f"\nLOCATION DATA (calculated, do not estimate distances yourself):\n"
+        f"- Candidate home address: {wohnadresse} ({distance_km:.0f}km from {job_location})\n"
+        f"- Candidate desired work locations: {gewuenschte_arbeitsorte or 'Not specified'}\n"
+        f"- Job location: {job_location}\n"
+        f"- Hard distance limit: {max_distance_km}km\n"
+        f"\nUse this factual distance in your evaluation. If the candidate listed the job\n"
+        f"city as a desired work location, treat this as a positive relocation signal.\n"
+        f"Do NOT estimate distances yourself - use the calculated value above.\n"
+    )
+
+
 async def evaluate_candidate(
     api_key: str,
     candidate_text: str,
     job_title: str,
     location: str,
     requirements: str,
+    distance_km: float | None = None,
+    wohnadresse: str | None = None,
+    gewuenschte_arbeitsorte: str | None = None,
+    max_distance_km: int = 200,
 ) -> EvalResult:
-    """Evaluate a candidate using Claude Haiku 4.5 via OpenRouter."""
+    """Evaluate a candidate using Claude Haiku 4.5 via OpenRouter.
+
+    When distance_km and wohnadresse are provided, a LOCATION DATA block is
+    injected into the prompt so Claude can make an informed distance decision.
+    When they are None, the prompt is identical to the original behaviour.
+    """
+    location_context = _build_location_context(
+        distance_km=distance_km,
+        wohnadresse=wohnadresse,
+        gewuenschte_arbeitsorte=gewuenschte_arbeitsorte,
+        job_location=location,
+        max_distance_km=max_distance_km,
+    )
     prompt = EVAL_PROMPT.format(
         job_title=job_title,
         location=location,
         requirements=requirements,
+        location_context=location_context,
         candidate_text=candidate_text,
     )
 
@@ -88,7 +131,9 @@ async def evaluate_candidate(
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError:
-                logger.warning(f"Claude response could not be parsed as JSON. Raw content (first 400 chars): {content[:400]!r}")
+                logger.warning(
+                    f"Claude response could not be parsed as JSON. Raw content (first 400 chars): {content[:400]!r}"
+                )
                 return EvalResult(reasoning="Error: could not parse evaluation response")
             return EvalResult(
                 match=bool(data.get("match", False)),
