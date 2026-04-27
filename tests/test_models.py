@@ -118,3 +118,24 @@ def test_settings_recruitee_fields(monkeypatch):
     s = Settings()
     assert s.recruitee_api_token == "bearer_test"
     assert s.recruitee_company_id == "61932"
+
+
+def test_job_input_max_distance_km_default():
+    job = JobInput(
+        offer_id="1",
+        stage_id="2",
+        job_title="Test",
+        location="Berlin",
+    )
+    assert job.max_distance_km == 200
+
+
+def test_job_input_max_distance_km_custom():
+    job = JobInput(
+        offer_id="1",
+        stage_id="2",
+        job_title="Test",
+        location="Berlin",
+        max_distance_km=75,
+    )
+    assert job.max_distance_km == 75
