@@ -85,7 +85,7 @@ def test_calculate_distance_km_success():
         mock_gc.geocode.side_effect = mock_geocode
         dist = calculate_distance_km("Hamburg", "Dortmund")
     assert dist is not None
-    assert 400 < dist < 450  # ~420 km
+    assert 280 < dist < 295  # ~287 km geodesic Hamburg-Dortmund
 
 
 def test_calculate_distance_km_geocode_failure_returns_none():
