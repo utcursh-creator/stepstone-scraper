@@ -76,10 +76,11 @@ async def _scrape_cards(page: Page) -> list[SearchResult]:
     results: list[SearchResult] = []
     cards = await page.query_selector_all(".miniprofile")
     if cards:
-        first_html = await cards[0].inner_html()
-        logger.info(f"DEBUG FIRST CARD HTML:\n{first_html[:3000]}")
-        first_outer = await cards[0].outer_html()
-        logger.info(f"DEBUG FIRST CARD OUTER:\n{first_outer[:500]}")
+        try:
+            first_html = await cards[0].inner_html()
+            logger.info(f"DEBUG FIRST CARD HTML:\n{first_html[:5000]}")
+        except Exception as e:
+            logger.warning(f"DEBUG card HTML failed: {e}")
     for card in cards:
         try:
             # Profile URL + ID from .miniprofile__name link
