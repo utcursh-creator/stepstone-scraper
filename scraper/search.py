@@ -6,10 +6,13 @@ Based on live probing 2026-04-17:
 - Results are .miniprofile cards (10 per page default)
 - Profile ID extracted from miniprofile__name href query param profileID=XXX
 """
+import logging
 import re
 from urllib.parse import urlparse, parse_qs
 from patchright.async_api import Page
 from utils.delays import human_delay
+
+logger = logging.getLogger(__name__)
 
 DIRECTSEARCH_URL = "https://www.stepstone.de/5/index.cfm?event=directsearchgen4:searchprofiles"
 
@@ -72,6 +75,11 @@ async def _scrape_cards(page: Page) -> list[SearchResult]:
     """Extract candidate cards from the current results page."""
     results: list[SearchResult] = []
     cards = await page.query_selector_all(".miniprofile")
+    if cards:
+        first_html = await cards[0].inner_html()
+        logger.info(f"DEBUG FIRST CARD HTML:\n{first_html[:3000]}")
+        first_outer = await cards[0].outer_html()
+        logger.info(f"DEBUG FIRST CARD OUTER:\n{first_outer[:500]}")
     for card in cards:
         try:
             # Profile URL + ID from .miniprofile__name link
