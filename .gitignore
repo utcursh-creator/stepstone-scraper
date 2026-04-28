@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.vscode/
 sessions/
 state/
 screenshots/
