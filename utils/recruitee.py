@@ -143,7 +143,7 @@ async def set_stage(
 
     Returns True on success, False on failure (non-fatal, logged).
     """
-    url = f"{RECRUITEE_API}/c/{company_id}/placements/{placement_id}"
+    url = f"{RECRUITEE_API}/c/{company_id}/placements/{placement_id}/change_stage"
     body = {"stage_id": stage_id}
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         try:
