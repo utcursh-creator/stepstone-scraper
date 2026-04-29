@@ -12,4 +12,4 @@ class JobInput(BaseModel):
     location: str
     requirements: str = ""
     max_candidates: int = 50
-    max_distance_km: int = 200  # Hard ceiling for distance rejection (km)
+    max_distance_km: int = 25  # Hard ceiling for distance rejection (km)
