@@ -19,8 +19,6 @@ from scraper.search import search_candidates
 from utils.delays import human_delay
 from utils.geocode import (
     clear_cache,
-    extract_wohnadresse,
-    extract_gewuenschte_arbeitsorte,
     calculate_distance_km,
     check_desired_location_match,
 )
@@ -205,20 +203,47 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 logger.info(f"Skipping duplicate: {candidate.profile_id}")
                 continue
 
-            # 4b. Distance validation (saves API call + unlock credit)
-            wohnadresse = extract_wohnadresse(candidate.preview_text)
-            gewuenschte_arbeitsorte = extract_gewuenschte_arbeitsorte(candidate.preview_text)
+            # 4b. PRE-UNLOCK GATE 1: CV attachment check
+            # Umair rule: candidates without CVs = "unqualified", skip unlock
+            if not candidate.has_cv_attachment:
+                logger.info(
+                    f"  SKIPPED {candidate.profile_id}: "
+                    f"no CV attachment detected in Anhänge section"
+                )
+                result.candidates.append(
+                    CandidateResult(
+                        name="",
+                        stepstone_profile_id=candidate.profile_id,
+                        matched=False,
+                        match_confidence=0.0,
+                        match_reasoning="Übersprungen: Kein Lebenslauf in Anhänge vorhanden.",
+                        unlocked=False,
+                        unlock_reason="no_cv",
+                        account_used=account_label,
+                    )
+                )
+                processed += 1
+                continue
+
+            # 4c. PRE-UNLOCK GATE 2: Distance validation (card-level Wohnort)
+            wohnort = candidate.wohnort
+            gewuenschte_list = candidate.gewuenschte_arbeitsorte
+            gewuenschte_str = " ".join(gewuenschte_list) if gewuenschte_list else None
             distance_km = None
 
-            if wohnadresse:
-                distance_km = calculate_distance_km(wohnadresse, job.location)
+            if wohnort:
+                distance_km = calculate_distance_km(wohnort, job.location)
+                logger.info(
+                    f"  Card-level distance for {candidate.profile_id}: "
+                    f"Wohnort={wohnort}, distance={distance_km}km"
+                )
 
             if distance_km is not None and distance_km > job.max_distance_km:
-                desired_match = check_desired_location_match(gewuenschte_arbeitsorte, job.location)
+                desired_match = check_desired_location_match(gewuenschte_str, job.location)
                 if not desired_match:
                     logger.info(
                         f"  REJECTED {candidate.profile_id}: "
-                        f"home {wohnadresse} is {distance_km:.0f}km from {job.location} "
+                        f"Wohnort {wohnort} is {distance_km:.0f}km from {job.location} "
                         f"(max {job.max_distance_km}km, no desired location match)"
                     )
                     result.candidates.append(
@@ -228,7 +253,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             matched=False,
                             match_confidence=0.0,
                             match_reasoning=(
-                                f"ABGELEHNT: Wohnadresse {wohnadresse} liegt {distance_km:.0f}km "
+                                f"ABGELEHNT: Wohnort {wohnort} liegt {distance_km:.0f}km "
                                 f"von {job.location} entfernt (Maximum: {job.max_distance_km}km). "
                                 f"Keine Umzugsbereitschaft erkennbar."
                             ),
@@ -240,8 +265,12 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     processed += 1
                     continue
 
-            # 4c. Evaluate with Claude (with factual distance data when available)
-            logger.info(f"Evaluating {candidate.profile_id} (preview_text {len(candidate.preview_text)} chars)")
+            # 4d. Evaluate with Claude (with card-level distance data)
+            logger.info(
+                f"Evaluating {candidate.profile_id} "
+                f"(preview_text {len(candidate.preview_text)} chars, "
+                f"wohnort={wohnort or 'unknown'}, distance={distance_km}km)"
+            )
             eval_result = await evaluate_candidate(
                 api_key=settings.openrouter_api_key,
                 candidate_text=candidate.preview_text,
@@ -249,8 +278,8 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 location=job.location,
                 requirements=job.requirements,
                 distance_km=distance_km,
-                wohnadresse=wohnadresse,
-                gewuenschte_arbeitsorte=gewuenschte_arbeitsorte,
+                wohnadresse=wohnort,
+                gewuenschte_arbeitsorte=gewuenschte_str,
                 max_distance_km=job.max_distance_km,
             )
             logger.info(f"  eval match={eval_result.match} conf={eval_result.confidence} reason={eval_result.reasoning[:150]}")
