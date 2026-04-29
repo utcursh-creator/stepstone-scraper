@@ -156,22 +156,23 @@ async def set_stage(
             return False
 
 
-async def check_candidate_exists_on_offer(
+async def check_candidate_exists_in_recruitee(
     token: str,
     company_id: str,
     email: str,
-    offer_id: int,
-) -> tuple[bool, int | None]:
-    """Check if a candidate with this email already exists on this offer in Recruitee.
+) -> tuple[bool, int | None, list[int]]:
+    """Check if a candidate with this email exists ANYWHERE in Recruitee.
 
-    Queries the Recruitee candidates search endpoint by email. If a candidate
-    is found with a placement on the same offer_id, returns (True, candidate_id).
-    Otherwise returns (False, None).
+    Searches the entire Recruitee account by email. If a candidate is found
+    with this email (regardless of which offer they were placed on), returns
+    (True, candidate_id, [list of offer_ids the candidate is placed on]).
+    Otherwise returns (False, None, []).
 
-    This catches manually-added candidates that are not in our Airtable dedup table.
+    Catches both manually-added candidates AND candidates placed on different
+    offers in the past — anyone the recruiter has already seen.
     """
     if not email:
-        return False, None
+        return False, None, []
 
     url = f"{RECRUITEE_API}/c/{company_id}/candidates"
     params = {"query": email}
@@ -182,26 +183,24 @@ async def check_candidate_exists_on_offer(
             resp.raise_for_status()
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.HTTPError) as e:
             logger.warning(f"Recruitee dedup check failed for {email}: {e}")
-            return False, None  # Fail open — don't block on dedup errors
+            return False, None, []  # Fail open — don't block on dedup errors
 
     data = resp.json()
     candidates = data.get("candidates", [])
 
     for candidate in candidates:
-        # Check if any email matches (case-insensitive)
+        # Case-insensitive email match
         candidate_emails = [e.lower() for e in candidate.get("emails", [])]
         if email.lower() not in candidate_emails:
             continue
 
-        # Check if this candidate has a placement on the same offer
+        existing_id = candidate.get("id")
         placements = candidate.get("placements", [])
-        for placement in placements:
-            if placement.get("offer_id") == offer_id:
-                existing_id = candidate.get("id")
-                logger.info(
-                    f"Recruitee dedup: candidate with email {email} already exists "
-                    f"on offer {offer_id} (candidate_id={existing_id})"
-                )
-                return True, existing_id
+        offer_ids = [p.get("offer_id") for p in placements if p.get("offer_id")]
+        logger.info(
+            f"Recruitee dedup: candidate with email {email} already exists "
+            f"(candidate_id={existing_id}, placements on offers: {offer_ids})"
+        )
+        return True, existing_id, offer_ids
 
-    return False, None
+    return False, None, []

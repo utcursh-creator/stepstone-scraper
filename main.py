@@ -25,7 +25,7 @@ from utils.geocode import (
     check_desired_location_match,
 )
 from utils.openrouter import evaluate_candidate
-from utils.recruitee import create_candidate, upload_cv, set_stage, check_candidate_exists_on_offer, RecruiteeError
+from utils.recruitee import create_candidate, upload_cv, set_stage, check_candidate_exists_in_recruitee, RecruiteeError
 from utils.webhook import send_webhook
 
 load_dotenv()
@@ -311,14 +311,13 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             )
             if profile:
                 # ============================================================
-                # POST-UNLOCK GATE 1: Distance safety net
-                # For the ~10% of cards where Wohnort was not visible pre-unlock,
-                # the full profile text contains Wohnadresse. Check it now.
-                # Credits are already spent, but we prevent distant candidates
-                # from reaching Recruitee.
+                # POST-UNLOCK GATE 1: Distance safety net (FAIL-CLOSED)
+                # If card-level Wohnort was missing, try full profile text.
+                # If we STILL can't determine location, reject — never push a
+                # candidate to Recruitee whose distance we can't verify.
                 # ============================================================
-                if distance_km is None and profile.profile_text:
-                    post_unlock_addr = extract_wohnadresse(profile.profile_text)
+                if distance_km is None:
+                    post_unlock_addr = extract_wohnadresse(profile.profile_text) if profile.profile_text else None
                     if post_unlock_addr:
                         distance_km = calculate_distance_km(post_unlock_addr, job.location)
                         logger.info(
@@ -351,30 +350,54 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                                 processed += 1
                                 await human_delay(1000, 3000)
                                 continue
+                    else:
+                        # Diagnostic: dump profile_text snippet so we can fix the regex later
+                        snippet = (profile.profile_text or "")[:1500].replace("\n", " | ")
+                        logger.warning(
+                            f"  LOCATION UNKNOWN {candidate.profile_id}: card had no Wohnort, "
+                            f"and extract_wohnadresse() found nothing in profile_text. "
+                            f"Snippet: {snippet}"
+                        )
+                        # Fail closed — don't push someone whose distance we can't verify
+                        profile.matched = False
+                        profile.match_confidence = eval_result.confidence
+                        profile.match_reasoning = (
+                            "ABGELEHNT: Wohnort konnte weder aus dem Suchergebnis noch aus dem "
+                            "vollen Profil ermittelt werden. Sicherheits-Skip, um keinen entfernten "
+                            "Kandidaten in Recruitee zu pushen."
+                        )
+                        profile.unlocked = True
+                        profile.unlock_reason = "location_unknown"
+                        profile.cv_base64 = None
+                        result.candidates.append(profile)
+                        processed += 1
+                        await human_delay(1000, 3000)
+                        continue
 
                 # ============================================================
-                # POST-UNLOCK GATE 2: Recruitee email dedup
-                # Catches candidates who were manually added to Recruitee by
-                # recruiters (not in our Airtable dedup table). Prevents
-                # duplicate entries on the same offer.
+                # POST-UNLOCK GATE 2: Global Recruitee dedup
+                # Skip if email exists ANYWHERE in Recruitee (any offer, any
+                # status). Catches both manually-added candidates and people
+                # the recruiter has already sourced for other jobs in the past.
                 # ============================================================
                 if profile.email and settings.recruitee_api_token:
-                    already_exists, existing_candidate_id = await check_candidate_exists_on_offer(
+                    already_exists, existing_candidate_id, existing_offer_ids = await check_candidate_exists_in_recruitee(
                         token=settings.recruitee_api_token,
                         company_id=settings.recruitee_company_id,
                         email=profile.email,
-                        offer_id=int(job.offer_id),
                     )
                     if already_exists:
                         logger.info(
                             f"  RECRUITEE DEDUP: {candidate.profile_id} ({profile.email}) "
-                            f"already exists on offer {job.offer_id} as candidate {existing_candidate_id}"
+                            f"already exists in Recruitee (candidate {existing_candidate_id}, "
+                            f"placed on offers: {existing_offer_ids})"
                         )
                         profile.matched = True
                         profile.match_confidence = eval_result.confidence
                         profile.match_reasoning = (
                             f"Kandidat bereits in Recruitee vorhanden "
-                            f"(ID: {existing_candidate_id}). Übersprungen."
+                            f"(ID: {existing_candidate_id}, frühere Stellen: {existing_offer_ids}). "
+                            f"Übersprungen."
                         )
                         profile.unlocked = True
                         profile.unlock_reason = "already_in_recruitee"
