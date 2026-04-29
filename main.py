@@ -25,7 +25,14 @@ from utils.geocode import (
     check_desired_location_match,
 )
 from utils.openrouter import evaluate_candidate
-from utils.recruitee import create_candidate, upload_cv, set_stage, check_candidate_exists_in_recruitee, RecruiteeError
+from utils.recruitee import (
+    create_candidate,
+    upload_cv,
+    set_stage,
+    check_candidate_exists_in_recruitee,
+    clear_candidates_cache,
+    RecruiteeError,
+)
 from utils.webhook import send_webhook
 
 load_dotenv()
@@ -129,6 +136,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     """
     global current_status
     clear_cache()  # Reset geocoding cache for this job
+    clear_candidates_cache()  # Reset Recruitee candidate cache for this job
     current_status = {"state": "running", "job": job.model_dump(), "error": None}
     accounts = settings.get_accounts()
     account = next_account(accounts, COUNTER_PATH)

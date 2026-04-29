@@ -18,6 +18,18 @@ RECRUITEE_API = "https://api.recruitee.com"
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2.0
 REQUEST_TIMEOUT = 30.0
+CANDIDATES_PAGE_SIZE = 100  # Recruitee /candidates default; we paginate explicitly
+
+# Per-scrape cache of all Recruitee candidates. Populated on first dedup check,
+# reused for the rest of the run. Cleared via clear_candidates_cache() at the
+# start of every scrape job (called from main.run_scrape).
+_candidates_cache: list[dict] | None = None
+
+
+def clear_candidates_cache() -> None:
+    """Reset the Recruitee candidate cache between scrape jobs."""
+    global _candidates_cache
+    _candidates_cache = None
 
 
 class RecruiteeError(Exception):
@@ -156,6 +168,61 @@ async def set_stage(
             return False
 
 
+async def _fetch_all_candidates(token: str, company_id: str) -> list[dict]:
+    """Fetch every candidate in the Recruitee account, paginated.
+
+    Cached for the lifetime of a scrape run (see _candidates_cache + clear).
+    First call paginates through all candidates; subsequent calls reuse the
+    cache. The /candidates endpoint returns full candidate objects including
+    emails[] and placements[] so we can filter locally.
+
+    Why fetch-all-and-filter instead of a server-side email filter:
+    - GET /candidates `query` param only searches name/offer (per docs), NOT email.
+    - GET /search/new/candidates `filters_json` field name + operator for email
+      is not publicly documented; testing in production is risky.
+    - Local filter is unambiguous and works regardless of Recruitee's internal
+      filter syntax. With ~hundreds of candidates per Aramaz account, the cost
+      is acceptable (one paginated fetch per scrape run, then in-memory filter).
+    """
+    global _candidates_cache
+    if _candidates_cache is not None:
+        return _candidates_cache
+
+    url = f"{RECRUITEE_API}/c/{company_id}/candidates"
+    all_candidates: list[dict] = []
+    offset = 0
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        while True:
+            params = {"limit": CANDIDATES_PAGE_SIZE, "offset": offset}
+            try:
+                resp = await client.get(url, params=params, headers=_headers(token))
+                resp.raise_for_status()
+            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.HTTPError) as e:
+                logger.warning(
+                    f"Recruitee /candidates page fetch failed at offset={offset}: {e}. "
+                    f"Returning {len(all_candidates)} candidates collected so far."
+                )
+                # Fail open — don't break the scrape if dedup fetch fails partially
+                break
+
+            data = resp.json()
+            batch = data.get("candidates", [])
+            all_candidates.extend(batch)
+
+            if len(batch) < CANDIDATES_PAGE_SIZE:
+                # Last page reached
+                break
+            offset += CANDIDATES_PAGE_SIZE
+
+    logger.info(
+        f"Recruitee dedup cache: fetched {len(all_candidates)} candidates "
+        f"across {(offset // CANDIDATES_PAGE_SIZE) + 1} page(s)"
+    )
+    _candidates_cache = all_candidates
+    return all_candidates
+
+
 async def check_candidate_exists_in_recruitee(
     token: str,
     company_id: str,
@@ -163,10 +230,11 @@ async def check_candidate_exists_in_recruitee(
 ) -> tuple[bool, int | None, list[int]]:
     """Check if a candidate with this email exists ANYWHERE in Recruitee.
 
-    Searches the entire Recruitee account by email. If a candidate is found
-    with this email (regardless of which offer they were placed on), returns
-    (True, candidate_id, [list of offer_ids the candidate is placed on]).
-    Otherwise returns (False, None, []).
+    Returns (True, candidate_id, [offer_ids the candidate is placed on]) on
+    match, or (False, None, []) if not found / on dedup fetch failure.
+
+    Match is case-insensitive across the candidate's `emails` array, so
+    multiple emails per candidate are all checked.
 
     Catches both manually-added candidates AND candidates placed on different
     offers in the past — anyone the recruiter has already seen.
@@ -174,33 +242,25 @@ async def check_candidate_exists_in_recruitee(
     if not email:
         return False, None, []
 
-    url = f"{RECRUITEE_API}/c/{company_id}/candidates"
-    params = {"query": email}
-
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        try:
-            resp = await client.get(url, params=params, headers=_headers(token))
-            resp.raise_for_status()
-        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.HTTPError) as e:
-            logger.warning(f"Recruitee dedup check failed for {email}: {e}")
-            return False, None, []  # Fail open — don't block on dedup errors
-
-    data = resp.json()
-    candidates = data.get("candidates", [])
+    candidates = await _fetch_all_candidates(token, company_id)
+    email_lower = email.lower()
 
     for candidate in candidates:
-        # Case-insensitive email match
-        candidate_emails = [e.lower() for e in candidate.get("emails", [])]
-        if email.lower() not in candidate_emails:
+        candidate_emails = [
+            e.lower() for e in (candidate.get("emails") or [])
+            if isinstance(e, str)
+        ]
+        if email_lower not in candidate_emails:
             continue
 
         existing_id = candidate.get("id")
-        placements = candidate.get("placements", [])
+        placements = candidate.get("placements") or []
         offer_ids = [p.get("offer_id") for p in placements if p.get("offer_id")]
         logger.info(
-            f"Recruitee dedup: candidate with email {email} already exists "
-            f"(candidate_id={existing_id}, placements on offers: {offer_ids})"
+            f"Recruitee dedup HIT: email={email} matches candidate_id={existing_id} "
+            f"(placements on offers: {offer_ids})"
         )
         return True, existing_id, offer_ids
 
+    logger.info(f"Recruitee dedup MISS: email={email} not found in {len(candidates)} candidates")
     return False, None, []
