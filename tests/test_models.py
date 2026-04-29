@@ -127,7 +127,7 @@ def test_job_input_max_distance_km_default():
         job_title="Test",
         location="Berlin",
     )
-    assert job.max_distance_km == 200
+    assert job.max_distance_km == 25
 
 
 def test_job_input_max_distance_km_custom():

@@ -135,7 +135,7 @@ async def test_upload_cv_failure_returns_false():
 @respx.mock
 @pytest.mark.asyncio
 async def test_set_stage_success():
-    respx.patch(f"{BASE}/placements/222").mock(
+    respx.patch(f"{BASE}/placements/222/change_stage").mock(
         return_value=httpx.Response(200, json={"placement": {"id": 222}})
     )
     ok = await set_stage(
@@ -150,7 +150,7 @@ async def test_set_stage_success():
 @respx.mock
 @pytest.mark.asyncio
 async def test_set_stage_failure_returns_false():
-    respx.patch(f"{BASE}/placements/222").mock(
+    respx.patch(f"{BASE}/placements/222/change_stage").mock(
         return_value=httpx.Response(422, json={"error": "bad stage"})
     )
     ok = await set_stage(

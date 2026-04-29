@@ -20,7 +20,7 @@ class CandidateResult(BaseModel):
     recruitee_candidate_id: int | None = None
     recruitee_placement_id: int | None = None
     cv_uploaded: bool = False
-    recruitee_status: Literal["", "created", "cv_uploaded", "stage_set", "failed"] = ""
+    recruitee_status: Literal["", "created", "cv_uploaded", "stage_set", "failed", "duplicate"] = ""
 
 
 class ScrapeResult(BaseModel):

@@ -8,6 +8,7 @@ Three operations after a StepStone profile is unlocked:
 Each call retries up to MAX_RETRIES times with RETRY_DELAY_SECONDS backoff.
 """
 import asyncio
+import json
 import logging
 import httpx
 
@@ -153,3 +154,54 @@ async def set_stage(
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.HTTPError) as e:
             logger.error(f"Recruitee set_stage failed for placement_id={placement_id}: {e}")
             return False
+
+
+async def check_candidate_exists_on_offer(
+    token: str,
+    company_id: str,
+    email: str,
+    offer_id: int,
+) -> tuple[bool, int | None]:
+    """Check if a candidate with this email already exists on this offer in Recruitee.
+
+    Queries the Recruitee candidates search endpoint by email. If a candidate
+    is found with a placement on the same offer_id, returns (True, candidate_id).
+    Otherwise returns (False, None).
+
+    This catches manually-added candidates that are not in our Airtable dedup table.
+    """
+    if not email:
+        return False, None
+
+    url = f"{RECRUITEE_API}/c/{company_id}/candidates"
+    params = {"query": email}
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        try:
+            resp = await client.get(url, params=params, headers=_headers(token))
+            resp.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.HTTPError) as e:
+            logger.warning(f"Recruitee dedup check failed for {email}: {e}")
+            return False, None  # Fail open — don't block on dedup errors
+
+    data = resp.json()
+    candidates = data.get("candidates", [])
+
+    for candidate in candidates:
+        # Check if any email matches (case-insensitive)
+        candidate_emails = [e.lower() for e in candidate.get("emails", [])]
+        if email.lower() not in candidate_emails:
+            continue
+
+        # Check if this candidate has a placement on the same offer
+        placements = candidate.get("placements", [])
+        for placement in placements:
+            if placement.get("offer_id") == offer_id:
+                existing_id = candidate.get("id")
+                logger.info(
+                    f"Recruitee dedup: candidate with email {email} already exists "
+                    f"on offer {offer_id} (candidate_id={existing_id})"
+                )
+                return True, existing_id
+
+    return False, None

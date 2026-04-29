@@ -19,11 +19,13 @@ from scraper.search import search_candidates
 from utils.delays import human_delay
 from utils.geocode import (
     clear_cache,
+    extract_wohnadresse,
+    extract_gewuenschte_arbeitsorte,
     calculate_distance_km,
     check_desired_location_match,
 )
 from utils.openrouter import evaluate_candidate
-from utils.recruitee import create_candidate, upload_cv, set_stage, RecruiteeError
+from utils.recruitee import create_candidate, upload_cv, set_stage, check_candidate_exists_on_offer, RecruiteeError
 from utils.webhook import send_webhook
 
 load_dotenv()
@@ -308,11 +310,88 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 preview_cv_url=getattr(candidate, "cv_url", ""),
             )
             if profile:
+                # ============================================================
+                # POST-UNLOCK GATE 1: Distance safety net
+                # For the ~10% of cards where Wohnort was not visible pre-unlock,
+                # the full profile text contains Wohnadresse. Check it now.
+                # Credits are already spent, but we prevent distant candidates
+                # from reaching Recruitee.
+                # ============================================================
+                if distance_km is None and profile.profile_text:
+                    post_unlock_addr = extract_wohnadresse(profile.profile_text)
+                    if post_unlock_addr:
+                        distance_km = calculate_distance_km(post_unlock_addr, job.location)
+                        logger.info(
+                            f"  Post-unlock distance for {candidate.profile_id}: "
+                            f"Wohnadresse={post_unlock_addr}, distance={distance_km}km"
+                        )
+                        if distance_km is not None and distance_km > job.max_distance_km:
+                            gewuenschte_post = extract_gewuenschte_arbeitsorte(profile.profile_text)
+                            desired_match = check_desired_location_match(
+                                gewuenschte_post, job.location
+                            )
+                            if not desired_match:
+                                logger.info(
+                                    f"  POST-UNLOCK REJECTED {candidate.profile_id}: "
+                                    f"{post_unlock_addr} is {distance_km:.0f}km from {job.location} "
+                                    f"(max {job.max_distance_km}km)"
+                                )
+                                profile.matched = False
+                                profile.match_confidence = eval_result.confidence
+                                profile.match_reasoning = (
+                                    f"ABGELEHNT (nach Unlock): Wohnadresse {post_unlock_addr} liegt "
+                                    f"{distance_km:.0f}km von {job.location} entfernt "
+                                    f"(Maximum: {job.max_distance_km}km). "
+                                    f"Keine Umzugsbereitschaft erkennbar."
+                                )
+                                profile.unlocked = True
+                                profile.unlock_reason = "too_far_post_unlock"
+                                profile.cv_base64 = None
+                                result.candidates.append(profile)
+                                processed += 1
+                                await human_delay(1000, 3000)
+                                continue
+
+                # ============================================================
+                # POST-UNLOCK GATE 2: Recruitee email dedup
+                # Catches candidates who were manually added to Recruitee by
+                # recruiters (not in our Airtable dedup table). Prevents
+                # duplicate entries on the same offer.
+                # ============================================================
+                if profile.email and settings.recruitee_api_token:
+                    already_exists, existing_candidate_id = await check_candidate_exists_on_offer(
+                        token=settings.recruitee_api_token,
+                        company_id=settings.recruitee_company_id,
+                        email=profile.email,
+                        offer_id=int(job.offer_id),
+                    )
+                    if already_exists:
+                        logger.info(
+                            f"  RECRUITEE DEDUP: {candidate.profile_id} ({profile.email}) "
+                            f"already exists on offer {job.offer_id} as candidate {existing_candidate_id}"
+                        )
+                        profile.matched = True
+                        profile.match_confidence = eval_result.confidence
+                        profile.match_reasoning = (
+                            f"Kandidat bereits in Recruitee vorhanden "
+                            f"(ID: {existing_candidate_id}). Übersprungen."
+                        )
+                        profile.unlocked = True
+                        profile.unlock_reason = "already_in_recruitee"
+                        profile.recruitee_status = "duplicate"
+                        profile.cv_base64 = None
+                        result.candidates.append(profile)
+                        processed += 1
+                        await human_delay(1000, 3000)
+                        continue
+
+                # ============================================================
+                # All gates passed — push to Recruitee
+                # ============================================================
                 profile.matched = True
                 profile.match_confidence = eval_result.confidence
                 profile.match_reasoning = eval_result.reasoning
 
-                # 4d. Push to Recruitee (if configured)
                 if settings.recruitee_api_token:
                     await _push_to_recruitee(
                         profile=profile,
