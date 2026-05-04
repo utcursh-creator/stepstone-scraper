@@ -14,7 +14,7 @@ from scraper.auth import AuthenticationError, authenticate
 from scraper.browser import close_browser, create_browser
 from scraper.dedup import check_duplicate
 from scraper.profile import extract_profile
-from scraper.rotation import next_account
+from scraper.rotation import select_account
 from scraper.search import search_candidates
 from utils.delays import human_delay
 from utils.geocode import (
@@ -139,7 +139,8 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     clear_candidates_cache()  # Reset Recruitee candidate cache for this job
     current_status = {"state": "running", "job": job.model_dump(), "error": None}
     accounts = settings.get_accounts()
-    account = next_account(accounts, COUNTER_PATH)
+    logger.info(f"Job received: account_requested={job.account!r}")
+    account = select_account(accounts, job.account, COUNTER_PATH)
     account_label = f"Account {accounts.index(account) + 1}"
 
     result = ScrapeResult(
