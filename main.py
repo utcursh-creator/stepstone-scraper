@@ -321,9 +321,18 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             if profile:
                 # ============================================================
                 # POST-UNLOCK GATE 1: Distance safety net (FAIL-CLOSED)
-                # If card-level Wohnort was missing, try full profile text.
-                # If we STILL can't determine location, reject — never push a
+                # If card-level Wohnort was missing or didn't geocode, try the
+                # full profile text. If we STILL can't pin the candidate to a
+                # German location with a valid distance, reject — never push a
                 # candidate to Recruitee whose distance we can't verify.
+                #
+                # "Can't verify" includes BOTH cases:
+                #   (a) extract_wohnadresse() returns nothing
+                #   (b) extract_wohnadresse() returns an address that
+                #       Nominatim cannot geocode within Germany — typically
+                #       a foreign location like 'Sidi bennour' (Morocco).
+                # Pre-2026-05-04 the code only handled (a) and silently let (b)
+                # through, pushing foreign candidates to Recruitee.
                 # ============================================================
                 if distance_km is None:
                     post_unlock_addr = extract_wohnadresse(profile.profile_text) if profile.profile_text else None
@@ -333,48 +342,37 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             f"  Post-unlock distance for {candidate.profile_id}: "
                             f"Wohnadresse={post_unlock_addr}, distance={distance_km}km"
                         )
-                        if distance_km is not None and distance_km > job.max_distance_km:
-                            gewuenschte_post = extract_gewuenschte_arbeitsorte(profile.profile_text)
-                            desired_match = check_desired_location_match(
-                                gewuenschte_post, job.location
+
+                    if distance_km is None:
+                        # Either nothing was extracted, or the extracted address
+                        # didn't geocode within Germany — fail closed.
+                        if post_unlock_addr:
+                            logger.warning(
+                                f"  LOCATION UNGEOCODABLE {candidate.profile_id}: "
+                                f"Wohnadresse={post_unlock_addr!r} did not geocode within "
+                                f"Germany (likely foreign address). Fail-closed."
                             )
-                            if not desired_match:
-                                logger.info(
-                                    f"  POST-UNLOCK REJECTED {candidate.profile_id}: "
-                                    f"{post_unlock_addr} is {distance_km:.0f}km from {job.location} "
-                                    f"(max {job.max_distance_km}km)"
-                                )
-                                profile.matched = False
-                                profile.match_confidence = eval_result.confidence
-                                profile.match_reasoning = (
-                                    f"ABGELEHNT (nach Unlock): Wohnadresse {post_unlock_addr} liegt "
-                                    f"{distance_km:.0f}km von {job.location} entfernt "
-                                    f"(Maximum: {job.max_distance_km}km). "
-                                    f"Keine Umzugsbereitschaft erkennbar."
-                                )
-                                profile.unlocked = True
-                                profile.unlock_reason = "too_far_post_unlock"
-                                profile.cv_base64 = None
-                                result.candidates.append(profile)
-                                processed += 1
-                                await human_delay(1000, 3000)
-                                continue
-                    else:
-                        # Diagnostic: dump profile_text snippet so we can fix the regex later
-                        snippet = (profile.profile_text or "")[:1500].replace("\n", " | ")
-                        logger.warning(
-                            f"  LOCATION UNKNOWN {candidate.profile_id}: card had no Wohnort, "
-                            f"and extract_wohnadresse() found nothing in profile_text. "
-                            f"Snippet: {snippet}"
-                        )
-                        # Fail closed — don't push someone whose distance we can't verify
+                            reason_text = (
+                                f"ABGELEHNT: Wohnadresse {post_unlock_addr} konnte nicht "
+                                f"in Deutschland verortet werden (vermutlich Ausland). "
+                                f"Sicherheits-Skip, um keinen entfernten Kandidaten in "
+                                f"Recruitee zu pushen."
+                            )
+                        else:
+                            snippet = (profile.profile_text or "")[:1500].replace("\n", " | ")
+                            logger.warning(
+                                f"  LOCATION UNKNOWN {candidate.profile_id}: card had no Wohnort, "
+                                f"and extract_wohnadresse() found nothing in profile_text. "
+                                f"Snippet: {snippet}"
+                            )
+                            reason_text = (
+                                "ABGELEHNT: Wohnort konnte weder aus dem Suchergebnis noch aus dem "
+                                "vollen Profil ermittelt werden. Sicherheits-Skip, um keinen "
+                                "entfernten Kandidaten in Recruitee zu pushen."
+                            )
                         profile.matched = False
                         profile.match_confidence = eval_result.confidence
-                        profile.match_reasoning = (
-                            "ABGELEHNT: Wohnort konnte weder aus dem Suchergebnis noch aus dem "
-                            "vollen Profil ermittelt werden. Sicherheits-Skip, um keinen entfernten "
-                            "Kandidaten in Recruitee zu pushen."
-                        )
+                        profile.match_reasoning = reason_text
                         profile.unlocked = True
                         profile.unlock_reason = "location_unknown"
                         profile.cv_base64 = None
@@ -382,6 +380,33 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                         processed += 1
                         await human_delay(1000, 3000)
                         continue
+
+                    if distance_km > job.max_distance_km:
+                        gewuenschte_post = extract_gewuenschte_arbeitsorte(profile.profile_text)
+                        desired_match = check_desired_location_match(
+                            gewuenschte_post, job.location
+                        )
+                        if not desired_match:
+                            logger.info(
+                                f"  POST-UNLOCK REJECTED {candidate.profile_id}: "
+                                f"{post_unlock_addr} is {distance_km:.0f}km from {job.location} "
+                                f"(max {job.max_distance_km}km)"
+                            )
+                            profile.matched = False
+                            profile.match_confidence = eval_result.confidence
+                            profile.match_reasoning = (
+                                f"ABGELEHNT (nach Unlock): Wohnadresse {post_unlock_addr} liegt "
+                                f"{distance_km:.0f}km von {job.location} entfernt "
+                                f"(Maximum: {job.max_distance_km}km). "
+                                f"Keine Umzugsbereitschaft erkennbar."
+                            )
+                            profile.unlocked = True
+                            profile.unlock_reason = "too_far_post_unlock"
+                            profile.cv_base64 = None
+                            result.candidates.append(profile)
+                            processed += 1
+                            await human_delay(1000, 3000)
+                            continue
 
                 # ============================================================
                 # POST-UNLOCK GATE 2: Global Recruitee dedup
