@@ -430,13 +430,27 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                         )
 
                     if distance_km is None:
-                        # Either nothing was extracted, or the extracted address
-                        # didn't geocode within Germany — fail closed.
+                        # Two sub-cases here, treated very differently:
+                        #
+                        #   (a) post_unlock_addr is None — we genuinely couldn't
+                        #       extract any Wohnort. Umair's stated case: card
+                        #       had no Wohnort, CV had no Wohnort, but the
+                        #       workplace city in the CV may still match the
+                        #       target. → talent pool for manual review.
+                        #
+                        #   (b) post_unlock_addr is set but didn't geocode in
+                        #       Germany. The address was extracted but
+                        #       Nominatim returned nothing for "<addr>,
+                        #       Deutschland" — almost certainly a foreign
+                        #       location (e.g. Moroccan postal code 24353
+                        #       Sidi bennour). → hard reject, NO push: Umair
+                        #       does not want foreign candidates in Recruitee
+                        #       at all, including the talent pool.
                         if post_unlock_addr:
                             logger.warning(
                                 f"  LOCATION UNGEOCODABLE {candidate.profile_id}: "
                                 f"Wohnadresse={post_unlock_addr!r} did not geocode within "
-                                f"Germany (likely foreign address). Fail-closed."
+                                f"Germany (likely foreign address). Hard reject."
                             )
                             reason_text = (
                                 f"ABGELEHNT: Wohnadresse {post_unlock_addr} konnte nicht "
@@ -444,6 +458,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                                 f"Sicherheits-Skip, um keinen entfernten Kandidaten in "
                                 f"Recruitee zu pushen."
                             )
+                            # No talent-pool push for foreign candidates.
                         else:
                             snippet = (profile.profile_text or "")[:1500].replace("\n", " | ")
                             logger.warning(
@@ -453,17 +468,16 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             )
                             reason_text = (
                                 "ABGELEHNT: Wohnort konnte weder aus dem Suchergebnis noch aus dem "
-                                "vollen Profil ermittelt werden. Sicherheits-Skip, um keinen "
-                                "entfernten Kandidaten in Recruitee zu pushen."
+                                "vollen Profil ermittelt werden. Push in Talent Pool zur manuellen "
+                                "Sichtung — Arbeitsort im Lebenslauf könnte zur Zielregion passen."
                             )
-                        # Talent pool push BEFORE we strip cv_base64 — Umair
-                        # wants these for manual review (no Wohnort but the
-                        # CV's workplace city sometimes matches the target).
-                        await _maybe_push_to_talent_pool(
-                            profile=profile,
-                            original_offer_id=int(job.offer_id),
-                            reason="Standort Unklar",
-                        )
+                            # Talent pool push BEFORE we strip cv_base64 — only
+                            # for the truly-unknown case Umair described.
+                            await _maybe_push_to_talent_pool(
+                                profile=profile,
+                                original_offer_id=int(job.offer_id),
+                                reason="Standort Unklar",
+                            )
                         profile.matched = False
                         profile.match_confidence = eval_result.confidence
                         profile.match_reasoning = reason_text
@@ -481,16 +495,15 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             gewuenschte_post, job.location
                         )
                         if not desired_match:
+                            # German Wohnort, geocoded fine, just too far AND
+                            # no relocation signal. This is a clear-cut reject;
+                            # NOT a talent-pool case. The pool is for ambiguous
+                            # candidates (no Wohnort), not for ones we know
+                            # live too far away.
                             logger.info(
                                 f"  POST-UNLOCK REJECTED {candidate.profile_id}: "
                                 f"{post_unlock_addr} is {distance_km:.0f}km from {job.location} "
                                 f"(max {job.max_distance_km}km)"
-                            )
-                            # Talent pool push BEFORE we strip cv_base64.
-                            await _maybe_push_to_talent_pool(
-                                profile=profile,
-                                original_offer_id=int(job.offer_id),
-                                reason="Aus Radius",
                             )
                             profile.matched = False
                             profile.match_confidence = eval_result.confidence
