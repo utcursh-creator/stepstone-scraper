@@ -184,7 +184,10 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     clear_candidates_cache()  # Reset Recruitee candidate cache for this job
     current_status = {"state": "running", "job": job.model_dump(), "error": None}
     accounts = settings.get_accounts()
-    logger.info(f"Job received: account_requested={job.account!r}")
+    logger.info(
+        f"Job received: account_requested={job.account!r}, "
+        f"max_distance_km={job.max_distance_km}"
+    )
     account = select_account(accounts, job.account, COUNTER_PATH)
     account_label = f"Account {accounts.index(account) + 1}"
 
