@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     recruitee_api_token: str = ""
     recruitee_company_id: str = "61932"
 
+    # Talent pool — post-unlock rejects (too far / location unknown) get
+    # pushed here instead of being silently dropped, so a recruiter can
+    # manually review borderline candidates whose workplace city matches
+    # but whose Wohnort doesn't (or is missing). Both must be set for the
+    # feature to activate; either unset disables talent pool push.
+    recruitee_talent_pool_offer_id: int | None = None
+    recruitee_talent_pool_stage_id: int | None = None
+
     scrape_timeout_seconds: int = 1200
     max_candidates_per_job: int = 50
 

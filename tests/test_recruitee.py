@@ -181,3 +181,28 @@ async def test_create_candidate_source_tag():
     import json as _json
     body = _json.loads(route.calls[0].request.read())
     assert body["candidate"]["sources"] == ["StepStone Automation"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_candidate_custom_sources():
+    """Talent-pool path: caller can override sources with a richer label."""
+    route = respx.post(f"{BASE}/candidates").mock(
+        return_value=httpx.Response(
+            201,
+            json={"candidate": {"id": 1, "placements": [{"id": 2}]}},
+        )
+    )
+    custom = ["StepStone Automation", "Talent Pool: Aus Radius (Offer 2468686)"]
+    await create_candidate(
+        token=TOKEN,
+        company_id=COMPANY,
+        name="Test",
+        emails=[],
+        phones=[],
+        offer_id=2592624,
+        sources=custom,
+    )
+    import json as _json
+    body = _json.loads(route.calls[0].request.read())
+    assert body["candidate"]["sources"] == custom

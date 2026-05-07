@@ -78,6 +78,7 @@ async def create_candidate(
     emails: list[str],
     phones: list[str],
     offer_id: int,
+    sources: list[str] | None = None,
 ) -> tuple[int, int]:
     """Create a candidate in Recruitee and link to the offer.
 
@@ -87,6 +88,10 @@ async def create_candidate(
     CRITICAL: offer_ids must be at ROOT level of the payload body,
     NOT nested inside the candidate object. Nesting is silently ignored
     by Recruitee (returns 201 but placements is empty).
+
+    `sources` defaults to ["StepStone Automation"]. Talent-pool pushes
+    override this with a richer label so the recruiter can see why a
+    candidate landed in the pool and which offer triggered it.
     """
     url = f"{RECRUITEE_API}/c/{company_id}/candidates"
     body = {
@@ -94,7 +99,7 @@ async def create_candidate(
             "name": name,
             "emails": emails,
             "phones": phones,
-            "sources": ["StepStone Automation"],
+            "sources": sources or ["StepStone Automation"],
         },
         "offer_ids": [offer_id],  # ROOT level — not inside candidate
     }

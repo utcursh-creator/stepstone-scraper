@@ -63,12 +63,17 @@ async def _push_to_recruitee(
     stage_id: int,
     token: str,
     company_id: str,
+    sources: list[str] | None = None,
 ) -> None:
-    """Create candidate in Recruitee, upload CV, set Gesourct stage.
+    """Create candidate in Recruitee, upload CV, set stage.
 
     All three steps update profile in-place. Failures are non-fatal:
     we log errors and set recruitee_status='failed' so n8n can skip
     the Recruitee steps for this candidate.
+
+    `sources` defaults to ["StepStone Automation"]; talent-pool pushes
+    override it with a richer label that names the rejection reason and
+    the original offer ID so the recruiter has full audit context.
     """
     # Step 1: Create candidate + link to offer
     try:
@@ -79,6 +84,7 @@ async def _push_to_recruitee(
             emails=[profile.email] if profile.email else [],
             phones=[profile.phone] if profile.phone else [],
             offer_id=offer_id,
+            sources=sources,
         )
         profile.recruitee_candidate_id = candidate_id
         profile.recruitee_placement_id = placement_id
@@ -126,6 +132,45 @@ async def _push_to_recruitee(
             f"Stage set failed for placement {placement_id}; "
             f"status stays {profile.recruitee_status!r}"
         )
+
+
+async def _maybe_push_to_talent_pool(
+    profile: "CandidateResult",
+    original_offer_id: int,
+    reason: str,
+) -> None:
+    """Push a post-unlock-rejected candidate to the Recruitee talent pool job.
+
+    No-op if RECRUITEE_TALENT_POOL_OFFER_ID / RECRUITEE_TALENT_POOL_STAGE_ID
+    aren't configured, or if the Recruitee API token is missing — falls
+    back to the previous "drop" behaviour without raising.
+
+    `reason` is a short German label like 'Aus Radius' or 'Standort Unklar'
+    that appears in the candidate's `sources` field alongside the original
+    offer ID, so the recruiter can see why this candidate ended up in the
+    talent pool and trace it back to the original sourcing job.
+    """
+    if not settings.recruitee_api_token:
+        return
+    if not (settings.recruitee_talent_pool_offer_id and settings.recruitee_talent_pool_stage_id):
+        return
+
+    sources = [
+        "StepStone Automation",
+        f"Talent Pool: {reason} (Offer {original_offer_id})",
+    ]
+    logger.info(
+        f"  TALENT POOL PUSH {profile.stepstone_profile_id}: reason={reason!r}, "
+        f"original_offer={original_offer_id}"
+    )
+    await _push_to_recruitee(
+        profile=profile,
+        offer_id=settings.recruitee_talent_pool_offer_id,
+        stage_id=settings.recruitee_talent_pool_stage_id,
+        token=settings.recruitee_api_token,
+        company_id=settings.recruitee_company_id,
+        sources=sources,
+    )
 
 
 async def run_scrape(job: JobInput) -> ScrapeResult:
@@ -320,11 +365,52 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             )
             if profile:
                 # ============================================================
+                # POST-UNLOCK GATE 0: Global Recruitee dedup (runs FIRST)
+                # Skip if email exists ANYWHERE in Recruitee (any offer, any
+                # status). Catches both manually-added candidates and people
+                # the recruiter has already sourced for other jobs in the past.
+                #
+                # Runs before the distance gate so the talent-pool push below
+                # never creates duplicates: if a candidate is already in
+                # Recruitee (including the talent pool itself from a previous
+                # cycle), they're skipped here and never reach the talent-pool
+                # push branch.
+                # ============================================================
+                if profile.email and settings.recruitee_api_token:
+                    already_exists, existing_candidate_id, existing_offer_ids = await check_candidate_exists_in_recruitee(
+                        token=settings.recruitee_api_token,
+                        company_id=settings.recruitee_company_id,
+                        email=profile.email,
+                    )
+                    if already_exists:
+                        logger.info(
+                            f"  RECRUITEE DEDUP: {candidate.profile_id} ({profile.email}) "
+                            f"already exists in Recruitee (candidate {existing_candidate_id}, "
+                            f"placed on offers: {existing_offer_ids})"
+                        )
+                        profile.matched = True
+                        profile.match_confidence = eval_result.confidence
+                        profile.match_reasoning = (
+                            f"Kandidat bereits in Recruitee vorhanden "
+                            f"(ID: {existing_candidate_id}, frühere Stellen: {existing_offer_ids}). "
+                            f"Übersprungen."
+                        )
+                        profile.unlocked = True
+                        profile.unlock_reason = "already_in_recruitee"
+                        profile.recruitee_status = "duplicate"
+                        profile.cv_base64 = None
+                        result.candidates.append(profile)
+                        processed += 1
+                        await human_delay(1000, 3000)
+                        continue
+
+                # ============================================================
                 # POST-UNLOCK GATE 1: Distance safety net (FAIL-CLOSED)
                 # If card-level Wohnort was missing or didn't geocode, try the
                 # full profile text. If we STILL can't pin the candidate to a
-                # German location with a valid distance, reject — never push a
-                # candidate to Recruitee whose distance we can't verify.
+                # German location with a valid distance, reject — but push to
+                # the talent pool first (if configured) so the recruiter can
+                # manually review borderline candidates.
                 #
                 # "Can't verify" includes BOTH cases:
                 #   (a) extract_wohnadresse() returns nothing
@@ -370,6 +456,14 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                                 "vollen Profil ermittelt werden. Sicherheits-Skip, um keinen "
                                 "entfernten Kandidaten in Recruitee zu pushen."
                             )
+                        # Talent pool push BEFORE we strip cv_base64 — Umair
+                        # wants these for manual review (no Wohnort but the
+                        # CV's workplace city sometimes matches the target).
+                        await _maybe_push_to_talent_pool(
+                            profile=profile,
+                            original_offer_id=int(job.offer_id),
+                            reason="Standort Unklar",
+                        )
                         profile.matched = False
                         profile.match_confidence = eval_result.confidence
                         profile.match_reasoning = reason_text
@@ -392,6 +486,12 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                                 f"{post_unlock_addr} is {distance_km:.0f}km from {job.location} "
                                 f"(max {job.max_distance_km}km)"
                             )
+                            # Talent pool push BEFORE we strip cv_base64.
+                            await _maybe_push_to_talent_pool(
+                                profile=profile,
+                                original_offer_id=int(job.offer_id),
+                                reason="Aus Radius",
+                            )
                             profile.matched = False
                             profile.match_confidence = eval_result.confidence
                             profile.match_reasoning = (
@@ -407,40 +507,6 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             processed += 1
                             await human_delay(1000, 3000)
                             continue
-
-                # ============================================================
-                # POST-UNLOCK GATE 2: Global Recruitee dedup
-                # Skip if email exists ANYWHERE in Recruitee (any offer, any
-                # status). Catches both manually-added candidates and people
-                # the recruiter has already sourced for other jobs in the past.
-                # ============================================================
-                if profile.email and settings.recruitee_api_token:
-                    already_exists, existing_candidate_id, existing_offer_ids = await check_candidate_exists_in_recruitee(
-                        token=settings.recruitee_api_token,
-                        company_id=settings.recruitee_company_id,
-                        email=profile.email,
-                    )
-                    if already_exists:
-                        logger.info(
-                            f"  RECRUITEE DEDUP: {candidate.profile_id} ({profile.email}) "
-                            f"already exists in Recruitee (candidate {existing_candidate_id}, "
-                            f"placed on offers: {existing_offer_ids})"
-                        )
-                        profile.matched = True
-                        profile.match_confidence = eval_result.confidence
-                        profile.match_reasoning = (
-                            f"Kandidat bereits in Recruitee vorhanden "
-                            f"(ID: {existing_candidate_id}, frühere Stellen: {existing_offer_ids}). "
-                            f"Übersprungen."
-                        )
-                        profile.unlocked = True
-                        profile.unlock_reason = "already_in_recruitee"
-                        profile.recruitee_status = "duplicate"
-                        profile.cv_base64 = None
-                        result.candidates.append(profile)
-                        processed += 1
-                        await human_delay(1000, 3000)
-                        continue
 
                 # ============================================================
                 # All gates passed — push to Recruitee
