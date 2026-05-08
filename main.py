@@ -237,10 +237,16 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             else:
                 raise AuthenticationError("All accounts failed to authenticate")
 
-        # 3. Search
-        logger.info(f"Searching: {job.job_title} in {job.location}")
-        candidates, radius = await search_candidates(page, job.job_title, job.location)
-        logger.info(f"Found {len(candidates)} candidates (radius: {radius}km)")
+        # 3. Search — passes max_distance_km so StepStone's backend filters by
+        #    Wohnort within radius (instead of returning Dubai/Riga as keywords)
+        logger.info(f"Searching: {job.job_title} in {job.location} (radius={job.max_distance_km}km)")
+        candidates, radius = await search_candidates(
+            page, job.job_title, job.location, max_distance_km=job.max_distance_km
+        )
+        logger.info(
+            f"Found {len(candidates)} candidates "
+            f"(StepStone backend radius: {radius}km, request: {job.max_distance_km}km)"
+        )
         for c in candidates:
             logger.info(f"  card {c.profile_id}: preview_text={len(c.preview_text)} chars, cv_url={'yes' if c.cv_url else 'no'}")
 
