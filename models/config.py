@@ -40,6 +40,18 @@ class Settings(BaseSettings):
     scrape_timeout_seconds: int = 1200
     max_candidates_per_job: int = 50
 
+    # Distance gate — second-tier "relocation feasibility" cap.
+    # When a candidate's Wohnort exceeds the per-job max_distance_km BUT they
+    # listed the job city under "Gewünschter Arbeitsort" (relocation signal),
+    # the older softening logic let them through regardless of actual distance.
+    # Umair flagged Suraj Gajbhar (Koch, ~120 km from Apfeltrang) as having
+    # been pushed via this softening despite living too far to realistically
+    # commute or relocate quickly. This cap REJECTS relocation-signal
+    # candidates whose Wohnort is beyond `relocation_max_distance_km`,
+    # regardless of their stated desire. Set to 0 to disable softening
+    # entirely (pure Wohnort-only mode, no relocation acceptance).
+    relocation_max_distance_km: int = 200
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_accounts(self) -> list[dict]:

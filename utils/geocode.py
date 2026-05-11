@@ -158,3 +158,43 @@ def check_desired_location_match(
     job_base = re.sub(r"\s*\([^)]*\)", "", job_location.lower()).strip()
 
     return job_base in desired_lower
+
+
+# Distance-decision reason codes returned by should_accept_far_candidate.
+# These are stable strings used for logging + the candidate's rejection
+# message in German. Keep them in sync if you add new codes.
+DIST_TOO_FAR_NO_RELOCATION = "too_far_no_relocation"
+DIST_TOO_FAR_FOR_RELOCATION = "too_far_for_relocation"
+DIST_RELOCATION_ACCEPTED = "relocation_accepted"
+
+
+def should_accept_far_candidate(
+    distance_km: float,
+    relocation_max_km: int,
+    gewuenschte_arbeitsorte: str | None,
+    job_location: str | None,
+) -> tuple[bool, str]:
+    """Decide whether a candidate whose Wohnort exceeds the job radius is still
+    acceptable as a relocation candidate.
+
+    Caller is responsible for the first-tier check (distance_km > max_distance_km);
+    this function only handles the "what now?" decision for the far-Wohnort case.
+
+    Logic (option B from the design discussion — Umair's choice):
+      1. If `distance_km > relocation_max_km`: REJECT. The candidate is too far
+         for any relocation signal to be plausible (Suraj-style 120 km Koch case).
+      2. Otherwise, if the candidate's `gewünschte_arbeitsorte` mentions the
+         job city: ACCEPT. They're a relocation candidate within feasible range.
+      3. Otherwise: REJECT. Too far without any relocation signal.
+
+    `relocation_max_km == 0` means "no softening at all" — every far-Wohnort
+    candidate is rejected, even with a perfect relocation signal.
+
+    Returns (accepted, reason_code) where reason_code is one of the
+    DIST_* constants above.
+    """
+    if relocation_max_km <= 0 or distance_km > relocation_max_km:
+        return False, DIST_TOO_FAR_FOR_RELOCATION
+    if check_desired_location_match(gewuenschte_arbeitsorte, job_location):
+        return True, DIST_RELOCATION_ACCEPTED
+    return False, DIST_TOO_FAR_NO_RELOCATION

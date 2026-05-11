@@ -5,7 +5,11 @@ from utils.geocode import (
     extract_gewuenschte_arbeitsorte,
     calculate_distance_km,
     check_desired_location_match,
+    should_accept_far_candidate,
     clear_cache,
+    DIST_TOO_FAR_NO_RELOCATION,
+    DIST_TOO_FAR_FOR_RELOCATION,
+    DIST_RELOCATION_ACCEPTED,
 )
 
 
@@ -108,3 +112,98 @@ def test_calculate_distance_km_uses_cache():
         # Second call should use cache, no new geocode call
         calculate_distance_km("TestCity", "TestCity")
         assert mock_gc.geocode.call_count == call_count_after_first
+
+
+# -- should_accept_far_candidate (option B: relocation cap) --
+#
+# The first-tier check (distance ≤ max) is the caller's responsibility; this
+# helper only handles candidates already known to be beyond the strict radius.
+
+def test_relocation_accepted_when_within_cap_and_desired_match():
+    """Classic relocation case: 80 km Wohnort, wants to work in target city,
+    well inside the 200 km feasibility cap → accepted."""
+    accepted, reason = should_accept_far_candidate(
+        distance_km=80.0,
+        relocation_max_km=200,
+        gewuenschte_arbeitsorte="Apfeltrang München",
+        job_location="Apfeltrang",
+    )
+    assert accepted is True
+    assert reason == DIST_RELOCATION_ACCEPTED
+
+
+def test_relocation_rejected_when_beyond_cap_even_with_desired_match():
+    """Regression test for Suraj Gajbhar — 120 km Wohnort with Apfeltrang in
+    his desired locations USED to be accepted via the relocation softening.
+    With a 100 km cap he must now be rejected; the desired-match no longer
+    matters once we're beyond the feasibility distance."""
+    accepted, reason = should_accept_far_candidate(
+        distance_km=120.0,
+        relocation_max_km=100,  # tight cap for this test
+        gewuenschte_arbeitsorte="Apfeltrang München bundesweit",
+        job_location="Apfeltrang",
+    )
+    assert accepted is False
+    assert reason == DIST_TOO_FAR_FOR_RELOCATION
+
+
+def test_rejected_within_cap_but_no_desired_match():
+    """Wohnort beyond strict radius but inside the relocation cap, no
+    Gewünschter-Arbeitsort match → no signal, reject."""
+    accepted, reason = should_accept_far_candidate(
+        distance_km=80.0,
+        relocation_max_km=200,
+        gewuenschte_arbeitsorte="Berlin Hamburg",  # no Apfeltrang
+        job_location="Apfeltrang",
+    )
+    assert accepted is False
+    assert reason == DIST_TOO_FAR_NO_RELOCATION
+
+
+def test_relocation_cap_zero_disables_softening_entirely():
+    """relocation_max_km == 0 → pure Wohnort-only mode: every far candidate
+    is rejected, even with a matching gewünschte_arbeitsorte."""
+    accepted, reason = should_accept_far_candidate(
+        distance_km=30.0,
+        relocation_max_km=0,
+        gewuenschte_arbeitsorte="Apfeltrang",
+        job_location="Apfeltrang",
+    )
+    assert accepted is False
+    assert reason == DIST_TOO_FAR_FOR_RELOCATION
+
+
+def test_relocation_at_exact_cap_is_accepted():
+    """Boundary: distance == cap is within the feasibility window (≤)."""
+    accepted, reason = should_accept_far_candidate(
+        distance_km=200.0,
+        relocation_max_km=200,
+        gewuenschte_arbeitsorte="Apfeltrang",
+        job_location="Apfeltrang",
+    )
+    assert accepted is True
+    assert reason == DIST_RELOCATION_ACCEPTED
+
+
+def test_relocation_one_km_beyond_cap_is_rejected():
+    """Boundary: distance == cap + 1 is outside the feasibility window."""
+    accepted, reason = should_accept_far_candidate(
+        distance_km=201.0,
+        relocation_max_km=200,
+        gewuenschte_arbeitsorte="Apfeltrang",
+        job_location="Apfeltrang",
+    )
+    assert accepted is False
+    assert reason == DIST_TOO_FAR_FOR_RELOCATION
+
+
+def test_relocation_with_no_gewuenschte_arbeitsorte():
+    """No desired-location field at all → no signal even within cap → reject."""
+    accepted, reason = should_accept_far_candidate(
+        distance_km=50.0,
+        relocation_max_km=200,
+        gewuenschte_arbeitsorte=None,
+        job_location="Apfeltrang",
+    )
+    assert accepted is False
+    assert reason == DIST_TOO_FAR_NO_RELOCATION

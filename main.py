@@ -23,6 +23,8 @@ from utils.geocode import (
     extract_gewuenschte_arbeitsorte,
     calculate_distance_km,
     check_desired_location_match,
+    should_accept_far_candidate,
+    DIST_TOO_FAR_FOR_RELOCATION,
 )
 from utils.openrouter import evaluate_candidate
 from utils.recruitee import (
@@ -313,12 +315,34 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 )
 
             if distance_km is not None and distance_km > job.max_distance_km:
-                desired_match = check_desired_location_match(gewuenschte_str, job.location)
-                if not desired_match:
+                accepted, dist_reason = should_accept_far_candidate(
+                    distance_km=distance_km,
+                    relocation_max_km=settings.relocation_max_distance_km,
+                    gewuenschte_arbeitsorte=gewuenschte_str,
+                    job_location=job.location,
+                )
+                if not accepted:
+                    too_far_for_relocate = (dist_reason == DIST_TOO_FAR_FOR_RELOCATION)
+                    if too_far_for_relocate:
+                        reasoning_de = (
+                            f"ABGELEHNT: Wohnort {wohnort} liegt {distance_km:.0f}km "
+                            f"von {job.location} entfernt — über dem Umzugslimit von "
+                            f"{settings.relocation_max_distance_km}km. Auch mit Umzugswunsch "
+                            f"ist die Entfernung nicht realistisch."
+                        )
+                        unlock_reason_code = "too_far_for_relocation"
+                    else:
+                        reasoning_de = (
+                            f"ABGELEHNT: Wohnort {wohnort} liegt {distance_km:.0f}km "
+                            f"von {job.location} entfernt (Maximum: {job.max_distance_km}km). "
+                            f"Keine Umzugsbereitschaft erkennbar."
+                        )
+                        unlock_reason_code = "too_far"
                     logger.info(
-                        f"  REJECTED {candidate.profile_id}: "
+                        f"  REJECTED {candidate.profile_id} ({dist_reason}): "
                         f"Wohnort {wohnort} is {distance_km:.0f}km from {job.location} "
-                        f"(max {job.max_distance_km}km, no desired location match)"
+                        f"(max {job.max_distance_km}km, relocation cap "
+                        f"{settings.relocation_max_distance_km}km)"
                     )
                     result.candidates.append(
                         CandidateResult(
@@ -326,13 +350,9 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             stepstone_profile_id=candidate.profile_id,
                             matched=False,
                             match_confidence=0.0,
-                            match_reasoning=(
-                                f"ABGELEHNT: Wohnort {wohnort} liegt {distance_km:.0f}km "
-                                f"von {job.location} entfernt (Maximum: {job.max_distance_km}km). "
-                                f"Keine Umzugsbereitschaft erkennbar."
-                            ),
+                            match_reasoning=reasoning_de,
                             unlocked=False,
-                            unlock_reason="too_far",
+                            unlock_reason=unlock_reason_code,
                             account_used=account_label,
                         )
                     )
@@ -511,30 +531,49 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
 
                     if distance_km > job.max_distance_km:
                         gewuenschte_post = extract_gewuenschte_arbeitsorte(profile.profile_text)
-                        desired_match = check_desired_location_match(
-                            gewuenschte_post, job.location
+                        accepted_post, dist_reason_post = should_accept_far_candidate(
+                            distance_km=distance_km,
+                            relocation_max_km=settings.relocation_max_distance_km,
+                            gewuenschte_arbeitsorte=gewuenschte_post,
+                            job_location=job.location,
                         )
-                        if not desired_match:
-                            # German Wohnort, geocoded fine, just too far AND
-                            # no relocation signal. This is a clear-cut reject;
-                            # NOT a talent-pool case. The pool is for ambiguous
-                            # candidates (no Wohnort), not for ones we know
-                            # live too far away.
+                        if not accepted_post:
+                            # Too far. Either no relocation signal at all, OR
+                            # the candidate is beyond the relocation feasibility
+                            # cap (Suraj-style 120km Koch case — even with
+                            # Apfeltrang listed as a desired location, the
+                            # distance makes the relocation implausible).
+                            # Either way: hard reject. Not a talent-pool case;
+                            # the pool is for ambiguous-location candidates, not
+                            # for ones we know live too far away.
+                            too_far_for_relocate_post = (dist_reason_post == DIST_TOO_FAR_FOR_RELOCATION)
+                            if too_far_for_relocate_post:
+                                reasoning_post = (
+                                    f"ABGELEHNT (nach Unlock): Wohnadresse {post_unlock_addr} liegt "
+                                    f"{distance_km:.0f}km von {job.location} entfernt — über dem "
+                                    f"Umzugslimit von {settings.relocation_max_distance_km}km. "
+                                    f"Auch mit Umzugswunsch ist die Entfernung nicht realistisch."
+                                )
+                                unlock_reason_post = "too_far_for_relocation_post_unlock"
+                            else:
+                                reasoning_post = (
+                                    f"ABGELEHNT (nach Unlock): Wohnadresse {post_unlock_addr} liegt "
+                                    f"{distance_km:.0f}km von {job.location} entfernt "
+                                    f"(Maximum: {job.max_distance_km}km). "
+                                    f"Keine Umzugsbereitschaft erkennbar."
+                                )
+                                unlock_reason_post = "too_far_post_unlock"
                             logger.info(
-                                f"  POST-UNLOCK REJECTED {candidate.profile_id}: "
+                                f"  POST-UNLOCK REJECTED {candidate.profile_id} ({dist_reason_post}): "
                                 f"{post_unlock_addr} is {distance_km:.0f}km from {job.location} "
-                                f"(max {job.max_distance_km}km)"
+                                f"(max {job.max_distance_km}km, relocation cap "
+                                f"{settings.relocation_max_distance_km}km)"
                             )
                             profile.matched = False
                             profile.match_confidence = eval_result.confidence
-                            profile.match_reasoning = (
-                                f"ABGELEHNT (nach Unlock): Wohnadresse {post_unlock_addr} liegt "
-                                f"{distance_km:.0f}km von {job.location} entfernt "
-                                f"(Maximum: {job.max_distance_km}km). "
-                                f"Keine Umzugsbereitschaft erkennbar."
-                            )
+                            profile.match_reasoning = reasoning_post
                             profile.unlocked = True
-                            profile.unlock_reason = "too_far_post_unlock"
+                            profile.unlock_reason = unlock_reason_post
                             profile.cv_base64 = None
                             result.candidates.append(profile)
                             processed += 1
