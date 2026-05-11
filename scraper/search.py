@@ -149,10 +149,6 @@ def _extract_gewuenschte_from_card(text: str) -> list[str]:
     return []
 
 
-def _has_cv_attachment(text: str) -> bool:
-    return bool(re.search(r"Anhänge.*?\.pdf", text, re.IGNORECASE | re.DOTALL))
-
-
 async def _scrape_cards(page: Page) -> list[SearchResult]:
     """Extract candidate cards from the current results page."""
     results: list[SearchResult] = []
@@ -220,7 +216,13 @@ async def _scrape_cards(page: Page) -> list[SearchResult]:
             preview_text = (await card.inner_text()).strip()
 
             wohnort = _extract_wohnort_from_card(preview_text)
-            has_cv = _has_cv_attachment(preview_text)
+            # Structural CV check: the .miniprofile__attachmentdocument element
+            # exists in the card's DOM iff the candidate has a CV attached.
+            # The old text-regex r"Anhänge.*?\.pdf" was DOTALL-greedy and produced
+            # false positives when "Anhänge" appeared near any unrelated ".pdf"
+            # string in the card text — letting CV-less candidates through the
+            # pre-unlock gate and into Recruitee with no CV.
+            has_cv = bool(cv_url)
             gewuenschte = _extract_gewuenschte_from_card(preview_text)
 
             if profile_id:

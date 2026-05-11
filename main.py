@@ -67,14 +67,28 @@ async def _push_to_recruitee(
 ) -> None:
     """Create candidate in Recruitee, upload CV, set stage.
 
-    All three steps update profile in-place. Failures are non-fatal:
-    we log errors and set recruitee_status='failed' so n8n can skip
-    the Recruitee steps for this candidate.
+    REFUSES to push when profile.cv_base64 is missing — without a CV file the
+    Recruitee record is useless to the recruiter (Umair's feedback after
+    Martin Winkler / Thomas Neumann landed with 'Noch kein Lebenslauf'). A
+    missing cv_base64 at this point indicates either a CV-download failure
+    after unlock or a pre-unlock false positive; in both cases we'd rather
+    drop the candidate than dirty Recruitee with an empty profile.
 
     `sources` defaults to ["StepStone Automation"]; talent-pool pushes
     override it with a richer label that names the rejection reason and
     the original offer ID so the recruiter has full audit context.
     """
+    # Step 0: Require a CV. Abort BEFORE touching Recruitee — we don't want to
+    # create then orphan a half-formed candidate record.
+    if not profile.cv_base64:
+        logger.warning(
+            f"REFUSING Recruitee push for {profile.stepstone_profile_id}: "
+            f"cv_base64 is missing (CV download failed or pre-unlock false positive). "
+            f"Candidate will not be created in Recruitee."
+        )
+        profile.recruitee_status = "cv_missing"
+        return
+
     # Step 1: Create candidate + link to offer
     try:
         candidate_id, placement_id = await create_candidate(
@@ -94,28 +108,23 @@ async def _push_to_recruitee(
         profile.recruitee_status = "failed"
         return  # Skip CV upload and stage set if creation failed
 
-    # Step 2: Upload CV (non-fatal if cv_base64 missing or upload fails)
-    if profile.cv_base64:
-        import base64 as _base64
-        cv_bytes = _base64.b64decode(profile.cv_base64)
-        filename = profile.cv_filename or "CV.pdf"
-        uploaded = await upload_cv(
-            token=token,
-            company_id=company_id,
-            candidate_id=candidate_id,
-            cv_bytes=cv_bytes,
-            filename=filename,
-        )
-        profile.cv_uploaded = uploaded
-        if uploaded:
-            profile.recruitee_status = "cv_uploaded"
-        else:
-            logger.warning(
-                f"CV upload failed for Recruitee candidate {candidate_id}; continuing to stage set"
-            )
+    # Step 2: Upload CV (guaranteed present at this point — Step 0 enforces it)
+    import base64 as _base64
+    cv_bytes = _base64.b64decode(profile.cv_base64)
+    filename = profile.cv_filename or "CV.pdf"
+    uploaded = await upload_cv(
+        token=token,
+        company_id=company_id,
+        candidate_id=candidate_id,
+        cv_bytes=cv_bytes,
+        filename=filename,
+    )
+    profile.cv_uploaded = uploaded
+    if uploaded:
+        profile.recruitee_status = "cv_uploaded"
     else:
-        logger.info(
-            f"No cv_base64 for profile {profile.stepstone_profile_id}; skipping CV upload"
+        logger.warning(
+            f"CV upload to Recruitee failed for candidate {candidate_id}; continuing to stage set"
         )
 
     # Step 3: Set stage (non-fatal)
@@ -385,15 +394,17 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 # cycle), they're skipped here and never reach the talent-pool
                 # push branch.
                 # ============================================================
-                if profile.email and settings.recruitee_api_token:
+                if (profile.email or profile.phone) and settings.recruitee_api_token:
                     already_exists, existing_candidate_id, existing_offer_ids = await check_candidate_exists_in_recruitee(
                         token=settings.recruitee_api_token,
                         company_id=settings.recruitee_company_id,
                         email=profile.email,
+                        phone=profile.phone,
                     )
                     if already_exists:
                         logger.info(
-                            f"  RECRUITEE DEDUP: {candidate.profile_id} ({profile.email}) "
+                            f"  RECRUITEE DEDUP: {candidate.profile_id} "
+                            f"(email={profile.email!r}, phone={profile.phone!r}) "
                             f"already exists in Recruitee (candidate {existing_candidate_id}, "
                             f"placed on offers: {existing_offer_ids})"
                         )

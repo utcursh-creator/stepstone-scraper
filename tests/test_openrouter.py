@@ -197,3 +197,39 @@ async def test_evaluate_candidate_without_distance_data():
     payload = _json.loads(sent_body)
     prompt = payload["messages"][0]["content"]
     assert "LOCATION DATA" not in prompt
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_prompt_contains_internship_rejection_rule():
+    """The prompt must instruct Claude to reject internship-only candidates.
+
+    Regression test for Marlon Gehrmann (PTA Rüdesheim) and the LKW Bendestorf
+    set — candidates whose only role-relevant experience was a 6-month Praktikum
+    were matched and pushed to Recruitee under the old prompt's permissive Rules
+    3 + 5 ("lean toward MATCH").
+    """
+    route = respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"match": false, "confidence": 0.2, "reasoning": "nur Praktikum"}'}}]},
+        )
+    )
+    await evaluate_candidate(
+        api_key="sk-test",
+        candidate_text="01.02.2022-01.08.2022 PTA Apotheke Nastätten (Praktikum)",
+        job_title="Pharmazeutisch-technische Assistenz",
+        location="Rüdesheim am Rhein",
+        requirements="",
+    )
+    sent_body = route.calls[0].request.read()
+    import json as _json
+    payload = _json.loads(sent_body)
+    prompt = payload["messages"][0]["content"]
+    # The prompt must explicitly mention internships are not qualifying
+    assert "Praktikum" in prompt
+    assert "Trainee" in prompt or "Werkstudent" in prompt
+    assert "Ausbildung" in prompt
+    # And NOT contain the old "lean toward MATCH" instruction
+    assert "lean toward MATCH" not in prompt
+    assert "cast a wide net" not in prompt

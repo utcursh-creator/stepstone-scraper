@@ -5,11 +5,19 @@ Three operations after a StepStone profile is unlocked:
   2. upload_cv         - PATCH /candidates/<id>/update_cv
   3. set_stage         - PATCH /placements/<id>
 
+Plus a global dedup check (check_candidate_exists_in_recruitee) that matches
+existing Recruitee candidates by EITHER email OR normalized phone. Email-only
+matching was insufficient because recruiters often enter a candidate manually
+using the email from the CV, while our StepStone scraper extracts the email
+the candidate registered on StepStone with — these can differ. Phone is the
+stable identifier across both data sources.
+
 Each call retries up to MAX_RETRIES times with RETRY_DELAY_SECONDS backoff.
 """
 import asyncio
 import json
 import logging
+import re
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -228,44 +236,117 @@ async def _fetch_all_candidates(token: str, company_id: str) -> list[dict]:
     return all_candidates
 
 
+_PHONE_STRIP_RE = re.compile(r"[\s\-\(\)\.]+")
+
+
+def _normalize_phone(phone: str | None) -> str:
+    """Normalize a phone number for case-insensitive comparison.
+
+    Rules (tuned for German contract recruiting):
+      - Strip whitespace, dashes, parentheses, dots
+      - Convert German country-code prefixes to leading 0:
+          +49 / 0049 / 49 (when followed by enough digits) → 0
+      - Keep non-German country codes as-is with their leading +
+      - Drop anything that doesn't reduce to at least one digit (returns "")
+
+    Examples:
+      "+49 171 6109508"  → "01716109508"
+      "0049-171-6109508" → "01716109508"
+      "0171 6109508"     → "01716109508"
+      "(0171) 610-9508"  → "01716109508"
+      "+1 555 1234"      → "+15551234"
+      ""                 → ""
+      None               → ""
+      "abc"              → ""
+    """
+    if not phone:
+        return ""
+    # Strip separators
+    stripped = _PHONE_STRIP_RE.sub("", phone).strip()
+    if not stripped:
+        return ""
+    # Must contain at least one digit
+    if not any(c.isdigit() for c in stripped):
+        return ""
+    # German country-code normalization → leading 0
+    if stripped.startswith("+49"):
+        return "0" + stripped[3:]
+    if stripped.startswith("0049"):
+        return "0" + stripped[4:]
+    # Heuristic: starts with "49" + 9-11 more digits = bare DE number without +
+    if stripped.startswith("49") and len(stripped) >= 11 and stripped[2:].isdigit():
+        return "0" + stripped[2:]
+    return stripped
+
+
 async def check_candidate_exists_in_recruitee(
     token: str,
     company_id: str,
-    email: str,
+    email: str | None = None,
+    phone: str | None = None,
 ) -> tuple[bool, int | None, list[int]]:
-    """Check if a candidate with this email exists ANYWHERE in Recruitee.
+    """Check if a candidate matching this email OR phone exists in Recruitee.
 
     Returns (True, candidate_id, [offer_ids the candidate is placed on]) on
     match, or (False, None, []) if not found / on dedup fetch failure.
 
-    Match is case-insensitive across the candidate's `emails` array, so
-    multiple emails per candidate are all checked.
+    Matching rules (any one signature is sufficient):
+      - Email: case-insensitive, whitespace-trimmed, across the candidate's
+        `emails` array.
+      - Phone: normalized via _normalize_phone (strips separators, unifies
+        German country-code variants to a single "0..." form), across the
+        candidate's `phones` array.
+
+    Why both: a recruiter might add a candidate manually with the email
+    from their CV (e.g. aktuerk.b@hotmail.com), but our StepStone scraper
+    extracts the email the candidate registered with on StepStone (which
+    can differ). Phone is the stable identifier — it rarely changes across
+    a candidate's data-source representations.
 
     Catches both manually-added candidates AND candidates placed on different
     offers in the past — anyone the recruiter has already seen.
     """
-    if not email:
+    if not email and not phone:
         return False, None, []
 
     candidates = await _fetch_all_candidates(token, company_id)
-    email_lower = email.lower()
+    email_lower = email.lower().strip() if email else None
+    phone_norm = _normalize_phone(phone) if phone else ""
 
     for candidate in candidates:
-        candidate_emails = [
-            e.lower() for e in (candidate.get("emails") or [])
-            if isinstance(e, str)
-        ]
-        if email_lower not in candidate_emails:
-            continue
+        match_reason = None
 
-        existing_id = candidate.get("id")
-        placements = candidate.get("placements") or []
-        offer_ids = [p.get("offer_id") for p in placements if p.get("offer_id")]
-        logger.info(
-            f"Recruitee dedup HIT: email={email} matches candidate_id={existing_id} "
-            f"(placements on offers: {offer_ids})"
-        )
-        return True, existing_id, offer_ids
+        # Email match
+        if email_lower:
+            candidate_emails = [
+                e.lower().strip() for e in (candidate.get("emails") or [])
+                if isinstance(e, str)
+            ]
+            if email_lower in candidate_emails:
+                match_reason = f"email={email_lower!r}"
 
-    logger.info(f"Recruitee dedup MISS: email={email} not found in {len(candidates)} candidates")
+        # Phone match (only if email didn't already hit)
+        if not match_reason and phone_norm:
+            candidate_phones_norm = [
+                _normalize_phone(p) for p in (candidate.get("phones") or [])
+                if isinstance(p, str)
+            ]
+            candidate_phones_norm = [p for p in candidate_phones_norm if p]
+            if phone_norm in candidate_phones_norm:
+                match_reason = f"phone={phone_norm!r}"
+
+        if match_reason:
+            existing_id = candidate.get("id")
+            placements = candidate.get("placements") or []
+            offer_ids = [p.get("offer_id") for p in placements if p.get("offer_id")]
+            logger.info(
+                f"Recruitee dedup HIT ({match_reason}): candidate_id={existing_id} "
+                f"(placements on offers: {offer_ids})"
+            )
+            return True, existing_id, offer_ids
+
+    logger.info(
+        f"Recruitee dedup MISS: email={email!r} phone={phone!r} "
+        f"(phone_norm={phone_norm!r}) not found in {len(candidates)} candidates"
+    )
     return False, None, []

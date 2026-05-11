@@ -24,14 +24,29 @@ CANDIDATE PREVIEW:
 {candidate_text}
 
 EVALUATION RULES:
-1. Match the candidate's current or recent job title against the target job title
-2. Consider location proximity (candidate should be within reasonable commuting distance)
-3. CRITICAL: Do NOT penalize short tenures. If a candidate has been at their current job for only 1-2 months, this is POSITIVE - they are likely in probation period and open to new opportunities
-4. Focus on role alignment, not exact keyword matching
-5. When in doubt, lean toward MATCH (we want to cast a wide net; human recruiter reviews later)
+1. CRITICAL — INTERNSHIPS / TRAINEE / AUSBILDUNG DO NOT COUNT AS QUALIFYING EXPERIENCE.
+   The candidate must have at least one REAL, full-time professional position in
+   the target role. If their ONLY experience in this field is a Praktikum, Trainee,
+   Werkstudent, Ausbildung, Volontariat, or similar temporary/educational placement,
+   set match=false. Look for the words "Praktikum", "Praktikant", "Trainee",
+   "Werkstudent", "Ausbildung", "Volontariat", "Hospitanz" — if those are the only
+   role-relevant entries on the candidate's CV/preview, REJECT.
+2. Match the candidate's current or recent FULL-TIME job title against the target.
+3. Consider location proximity (use the calculated distance shown below when
+   provided; do NOT estimate distances yourself).
+4. Short tenure in a real full-time role is acceptable — 1-2 months in a regular
+   position can signal probation-period openness to new opportunities. But a short
+   tenure that is itself labeled Praktikum/Ausbildung/Trainee does NOT qualify
+   under Rule 1.
+5. Focus on role alignment, not exact keyword matching, but require evidence of
+   actual professional work in the field — not aspirational, not in-training,
+   not as a side-project.
+6. Make a defensible call. Do NOT default to match without clear professional
+   evidence in the target role. If you have to argue yourself into a match
+   ("they might have done X..."), that's a REJECT.
 
 Respond in JSON format only, no other text:
-{{"match": true/false, "confidence": 0.0-1.0, "reasoning": "brief explanation in German"}}"""
+{{"match": true/false, "confidence": 0.0-1.0, "reasoning": "brief explanation in German — if rejecting due to internship-only, say so explicitly"}}"""
 
 
 class EvalResult(BaseModel):
