@@ -274,6 +274,58 @@ async def _add_criterion_via_autosuggest(page: Page, term: str) -> None:
     await human_delay(2500, 4000)  # criterion commit + auto re-search
 
 
+async def _add_keyword_criterion(page: Page, keyword: str) -> bool:
+    """Add a keyword as a STICHWORT criterion (must appear in candidate profile).
+
+    Unlike job_title/location, we explicitly target the keyword section of the
+    autosuggest dropdown so the term is ANDed as a free-text keyword rather than
+    being interpreted as a job-title or location criterion. Returns True if a
+    keyword chip was added via the keyword section, False if it fell back.
+    """
+    field = await page.query_selector("#searchfield__textfield")
+    if not field:
+        return False
+    await field.click(force=True)
+    await field.fill("")
+    await human_delay(300, 600)
+    for ch in keyword:
+        await field.type(ch, delay=80)
+    await human_delay(2000, 3000)  # autosuggest debounce + render
+
+    # Click the verbatim item under the STICHWORT (keyword) section.
+    clicked = await page.evaluate(
+        """(kw) => {
+            const sections = Array.from(document.querySelectorAll('[class*=autosuggest__section-keyword]'));
+            for (const sec of sections) {
+                const items = Array.from(sec.querySelectorAll('.autosuggest__criteria'));
+                for (const it of items) {
+                    if ((it.innerText || '').trim().toLowerCase() === kw.toLowerCase()) {
+                        it.click();
+                        return true;
+                    }
+                }
+                if (items.length) { items[0].click(); return true; }
+            }
+            return false;
+        }""",
+        keyword,
+    )
+    if clicked:
+        await human_delay(2000, 3500)  # criterion commit + auto re-search
+        logger.info(f"Added keyword criterion via STICHWORT section: {keyword!r}")
+        return True
+
+    # Fallback: ArrowDown + Enter (may select a non-keyword section; log it)
+    logger.warning(
+        f"Keyword section not found for {keyword!r}; falling back to ArrowDown+Enter"
+    )
+    await field.press("ArrowDown")
+    await human_delay(300, 600)
+    await field.press("Enter")
+    await human_delay(2000, 3500)
+    return False
+
+
 async def _country_chip_present(page: Page) -> bool:
     """Returns True if a country/Ort chip is rendered in the query box.
 
@@ -375,6 +427,7 @@ async def search_candidates(
     job_title: str,
     location: str,
     max_distance_km: int = DEFAULT_RADIUS_KM,
+    keywords: list[str] | None = None,
 ) -> tuple[list[SearchResult], int | None]:
     """Search DirectSearch for candidates with structured location + radius.
 
@@ -430,6 +483,11 @@ async def search_candidates(
                     f"Radius hijack failed; StepStone backend keeps default 25km. "
                     f"main.py local gate (max_distance_km={max_distance_km}) compensates."
                 )
+
+    # 5b. Add job-specific keyword criteria (ANDed; narrows results + saves credits)
+    for kw in (keywords or []):
+        logger.info(f"Adding keyword criterion: {kw!r}")
+        await _add_keyword_criterion(page, kw)
 
     # 6. Bump page size to 50 — single click on the size selector
     await _set_page_size(page, 50)

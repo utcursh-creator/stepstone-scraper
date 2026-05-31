@@ -255,8 +255,12 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         #    Wohnort within radius (instead of returning Dubai/Riga as keywords)
         logger.info(f"Searching: {job.job_title} in {job.location} (radius={job.max_distance_km}km)")
         candidates, radius = await search_candidates(
-            page, job.job_title, job.location, max_distance_km=job.max_distance_km
+            page, job.job_title, job.location,
+            max_distance_km=job.max_distance_km,
+            keywords=job.keywords,
         )
+        if job.keywords:
+            logger.info(f"Applied job-specific keywords: {job.keywords}")
         logger.info(
             f"Found {len(candidates)} candidates "
             f"(StepStone backend radius: {radius}km, request: {job.max_distance_km}km)"

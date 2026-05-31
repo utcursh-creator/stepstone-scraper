@@ -139,3 +139,41 @@ def test_job_input_max_distance_km_custom():
         max_distance_km=75,
     )
     assert job.max_distance_km == 75
+
+
+# -- keywords field (Umair tags Recruitee offer; n8n forwards) --
+
+def test_jobinput_keywords_defaults_empty():
+    j = JobInput(offer_id="1", stage_id="2", job_title="Koch", location="Berlin")
+    assert j.keywords == []
+
+
+def test_jobinput_keywords_from_list():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords=["Armatur", "Industrie"])
+    assert j.keywords == ["Armatur", "Industrie"]
+
+
+def test_jobinput_keywords_from_comma_string():
+    # n8n may send a single comma-separated string from the Recruitee tag
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords="Armatur, Industrie")
+    assert j.keywords == ["Armatur", "Industrie"]
+
+
+def test_jobinput_keywords_from_single_string():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords="Armatur")
+    assert j.keywords == ["Armatur"]
+
+
+def test_jobinput_keywords_strips_blanks():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords="Armatur, , ,Industrie,")
+    assert j.keywords == ["Armatur", "Industrie"]
+
+
+def test_jobinput_keywords_none_is_empty():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords=None)
+    assert j.keywords == []
