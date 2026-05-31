@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     # entirely (pure Wohnort-only mode, no relocation acceptance).
     relocation_max_distance_km: int = 200
 
+    # Hard daily ceiling on StepStone profile unlocks across ALL jobs in a day.
+    # n8n sends each job as a separate /scrape request, so this is enforced via
+    # a persistent JSON counter (state/unlock_counter.json) that resets daily.
+    # The true backstop behind the per-job cap — even if n8n sends more jobs
+    # than expected, the scraper stops unlocking once the daily cap is hit.
+    # Set to 0 to disable the cap (NOT recommended in production).
+    max_unlocks_per_day: int = 100
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_accounts(self) -> list[dict]:

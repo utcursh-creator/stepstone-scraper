@@ -3,6 +3,7 @@ import logging
 import os
 import traceback
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -36,6 +37,7 @@ from utils.recruitee import (
     RecruiteeError,
 )
 from utils.webhook import send_webhook
+from utils import unlock_budget
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -46,6 +48,7 @@ scrape_lock = asyncio.Lock()
 current_status: dict = {"state": "idle", "job": None, "error": None}
 
 COUNTER_PATH = os.path.join("state", "account_counter.json")
+UNLOCK_COUNTER_PATH = os.path.join("state", "unlock_counter.json")
 
 
 @asynccontextmanager
@@ -404,7 +407,23 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 processed += 1
                 continue
 
-            # 4c. Unlock + extract profile
+            # 4c. DAILY UNLOCK BUDGET CHECK — hard credit ceiling across ALL jobs.
+            # n8n fires each job as its own /scrape request, so this persistent
+            # counter is the only thing that can enforce a true cross-job cap.
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if settings.max_unlocks_per_day > 0:
+                remaining = unlock_budget.budget_remaining(
+                    UNLOCK_COUNTER_PATH, settings.max_unlocks_per_day, today
+                )
+                if remaining <= 0:
+                    logger.warning(
+                        f"DAILY UNLOCK CAP REACHED ({settings.max_unlocks_per_day}). "
+                        f"Skipping unlock for {candidate.profile_id} and stopping this job."
+                    )
+                    result.partial = True
+                    break
+
+            # 4d. Unlock + extract profile (THIS CLICK SPENDS ONE CREDIT)
             logger.info(f"Match! Extracting profile {candidate.profile_id}")
             profile = await extract_profile(
                 page,
@@ -413,6 +432,13 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 preview_cv_url=getattr(candidate, "cv_url", ""),
             )
             if profile:
+                # Unlock succeeded — record the credit spend immediately, before
+                # any post-unlock gate can `continue` past this point.
+                _new_unlock_count = unlock_budget.record_unlock(UNLOCK_COUNTER_PATH, today)
+                logger.info(
+                    f"Unlock recorded: {_new_unlock_count}/{settings.max_unlocks_per_day} "
+                    f"today ({candidate.profile_id})"
+                )
                 # ============================================================
                 # POST-UNLOCK GATE 0: Global Recruitee dedup (runs FIRST)
                 # Skip if email exists ANYWHERE in Recruitee (any offer, any
