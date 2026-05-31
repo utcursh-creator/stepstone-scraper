@@ -148,21 +148,24 @@ async def _push_to_recruitee(
         )
 
 
-async def _maybe_push_to_talent_pool(
+async def _maybe_push_to_rejected_pipeline(
     profile: "CandidateResult",
     original_offer_id: int,
     reason: str,
 ) -> None:
-    """Push a post-unlock-rejected candidate to the Recruitee talent pool job.
+    """Push a post-unlock-REJECTED candidate to the dedicated Recruitee
+    'Rejected Candidates - StepStone DirectSearch' pipeline (offer 2592624,
+    configured via RECRUITEE_TALENT_POOL_OFFER_ID / _STAGE_ID).
 
-    No-op if RECRUITEE_TALENT_POOL_OFFER_ID / RECRUITEE_TALENT_POOL_STAGE_ID
-    aren't configured, or if the Recruitee API token is missing — falls
-    back to the previous "drop" behaviour without raising.
+    No-op if the offer/stage or API token are unset — falls back to the
+    previous "drop" behaviour without raising.
 
-    `reason` is a short German label like 'Aus Radius' or 'Standort Unklar'
-    that appears in the candidate's `sources` field alongside the original
-    offer ID, so the recruiter can see why this candidate ended up in the
-    talent pool and trace it back to the original sourcing job.
+    `reason` is a short German label like 'Aus Radius', 'Standort Unklar' or
+    'Ausland' shown in the candidate's `sources` field alongside the original
+    offer ID, so the recruiter sees WHY the candidate was rejected and which
+    sourcing job triggered it. The CV is uploaded too (callers push BEFORE
+    stripping cv_base64); if the CV is missing, _push_to_recruitee refuses
+    (recruitee_status='cv_missing'), consistent with the no-CV rule.
     """
     if not settings.recruitee_api_token:
         return
@@ -171,10 +174,10 @@ async def _maybe_push_to_talent_pool(
 
     sources = [
         "StepStone Automation",
-        f"Talent Pool: {reason} (Offer {original_offer_id})",
+        f"Abgelehnt: {reason} (Offer {original_offer_id})",
     ]
     logger.info(
-        f"  TALENT POOL PUSH {profile.stepstone_profile_id}: reason={reason!r}, "
+        f"  REJECTED PIPELINE PUSH {profile.stepstone_profile_id}: reason={reason!r}, "
         f"original_offer={original_offer_id}"
     )
     await _push_to_recruitee(
@@ -531,15 +534,20 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             logger.warning(
                                 f"  LOCATION UNGEOCODABLE {candidate.profile_id}: "
                                 f"Wohnadresse={post_unlock_addr!r} did not geocode within "
-                                f"Germany (likely foreign address). Hard reject."
+                                f"Germany (likely foreign address). Rejecting."
                             )
                             reason_text = (
                                 f"ABGELEHNT: Wohnadresse {post_unlock_addr} konnte nicht "
                                 f"in Deutschland verortet werden (vermutlich Ausland). "
-                                f"Sicherheits-Skip, um keinen entfernten Kandidaten in "
-                                f"Recruitee zu pushen."
+                                f"Push in Rejected-Pipeline zur manuellen Sichtung."
                             )
-                            # No talent-pool push for foreign candidates.
+                            # Route foreign rejects to the dedicated rejected
+                            # pipeline too (labeled "Ausland"), BEFORE cv strip.
+                            await _maybe_push_to_rejected_pipeline(
+                                profile=profile,
+                                original_offer_id=int(job.offer_id),
+                                reason="Ausland",
+                            )
                         else:
                             snippet = (profile.profile_text or "")[:1500].replace("\n", " | ")
                             logger.warning(
@@ -552,9 +560,8 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                                 "vollen Profil ermittelt werden. Push in Talent Pool zur manuellen "
                                 "Sichtung — Arbeitsort im Lebenslauf könnte zur Zielregion passen."
                             )
-                            # Talent pool push BEFORE we strip cv_base64 — only
-                            # for the truly-unknown case Umair described.
-                            await _maybe_push_to_talent_pool(
+                            # Rejected-pipeline push BEFORE we strip cv_base64.
+                            await _maybe_push_to_rejected_pipeline(
                                 profile=profile,
                                 original_offer_id=int(job.offer_id),
                                 reason="Standort Unklar",
@@ -615,6 +622,15 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             profile.match_reasoning = reasoning_post
                             profile.unlocked = True
                             profile.unlock_reason = unlock_reason_post
+                            # Route too-far rejects to the dedicated rejected
+                            # pipeline (reason "Aus Radius") BEFORE cv strip.
+                            # Covers both too_far_post_unlock and
+                            # too_far_for_relocation_post_unlock.
+                            await _maybe_push_to_rejected_pipeline(
+                                profile=profile,
+                                original_offer_id=int(job.offer_id),
+                                reason="Aus Radius",
+                            )
                             profile.cv_base64 = None
                             result.candidates.append(profile)
                             processed += 1
