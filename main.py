@@ -261,10 +261,21 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         for c in candidates:
             logger.info(f"  card {c.profile_id}: preview_text={len(c.preview_text)} chars, cv_url={'yes' if c.cv_url else 'no'}")
 
-        # 4. Process each candidate
+        # 4. Process each candidate.
+        # Effective per-job cap = min(what n8n requested, the server ceiling).
+        # settings.max_candidates_per_job is the central credit kill-switch —
+        # set MAX_CANDIDATES_PER_JOB=10 on Railway for the BenSourcing run.
+        effective_max_candidates = min(job.max_candidates, settings.max_candidates_per_job)
+        logger.info(
+            f"Per-job candidate ceiling: {effective_max_candidates} "
+            f"(job requested {job.max_candidates}, server cap {settings.max_candidates_per_job})"
+        )
         processed = 0
         for candidate in candidates:
-            if processed >= job.max_candidates:
+            if processed >= effective_max_candidates:
+                logger.info(
+                    f"Reached per-job cap ({effective_max_candidates}); stopping this job."
+                )
                 break
 
             # 4a. Dedup check
