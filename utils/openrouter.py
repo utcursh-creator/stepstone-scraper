@@ -7,12 +7,23 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 MODEL = "anthropic/claude-haiku-4-5"
-MAX_TOKENS = 300
+# 300 was too small: the German reasoning routinely ran past it, the JSON got
+# truncated mid-string, json.loads failed, and genuine match=true candidates
+# (seen 0.92/0.85/0.75 on 2026-06-01) were dropped as match=False. 1000 gives
+# ample headroom; well-formed responses stop early so this costs nothing extra.
+MAX_TOKENS = 1000
 TIMEOUT_SECONDS = 30
 
 # Claude Haiku 4.5 wraps JSON in markdown fences like ```json ... ``` or ``` ... ```.
 # Strip them before json.loads.
 _MD_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
+
+# Salvage regexes — recover the decision from a response whose JSON didn't parse
+# (e.g. truncated by the token limit). match/confidence are simple enough to pull
+# out directly even when the trailing reasoning string is unterminated.
+_SALVAGE_MATCH_RE = re.compile(r'"match"\s*:\s*(true|false)', re.IGNORECASE)
+_SALVAGE_CONF_RE = re.compile(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)')
+_SALVAGE_REASON_RE = re.compile(r'"reasoning"\s*:\s*"(.*)', re.DOTALL)
 
 EVAL_PROMPT = """You are a German recruitment specialist evaluating candidates for a specific job.
 
@@ -45,8 +56,9 @@ EVALUATION RULES:
    evidence in the target role. If you have to argue yourself into a match
    ("they might have done X..."), that's a REJECT.
 
-Respond in JSON format only, no other text:
-{{"match": true/false, "confidence": 0.0-1.0, "reasoning": "brief explanation in German — if rejecting due to internship-only, say so explicitly"}}"""
+Respond in JSON format only, no other text. Keep "reasoning" to ONE or TWO
+short sentences in German (if rejecting due to internship-only, say so):
+{{"match": true/false, "confidence": 0.0-1.0, "reasoning": "1-2 short sentences in German"}}"""
 
 
 class EvalResult(BaseModel):
@@ -68,6 +80,29 @@ def _extract_json(content: str) -> str:
     if start != -1 and end > start:
         return stripped[start:end + 1]
     return stripped
+
+
+def _salvage_eval(content: str) -> "EvalResult | None":
+    """Recover an EvalResult from a response whose JSON failed to parse.
+
+    Pulls match/confidence/reasoning out with regexes so a truncated response
+    (token-limit cut-off mid-reasoning) still yields the candidate's decision
+    instead of being silently dropped as match=False. Returns None only when
+    even the `match` field can't be found (genuinely unparseable).
+    """
+    m_match = _SALVAGE_MATCH_RE.search(content)
+    if not m_match:
+        return None
+    matched = m_match.group(1).lower() == "true"
+    m_conf = _SALVAGE_CONF_RE.search(content)
+    confidence = float(m_conf.group(1)) if m_conf else 0.0
+    m_reason = _SALVAGE_REASON_RE.search(content)
+    reasoning = m_reason.group(1).strip().rstrip('`"}\n ').strip() if m_reason else ""
+    return EvalResult(
+        match=matched,
+        confidence=confidence,
+        reasoning=reasoning or "(salvaged from truncated response)",
+    )
 
 
 def _build_location_context(
@@ -146,8 +181,17 @@ async def evaluate_candidate(
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError:
+                salvaged = _salvage_eval(content)
+                if salvaged is not None:
+                    logger.warning(
+                        f"Claude JSON did not parse (likely truncated); salvaged "
+                        f"match={salvaged.match} conf={salvaged.confidence}. "
+                        f"Raw (first 200): {content[:200]!r}"
+                    )
+                    return salvaged
                 logger.warning(
-                    f"Claude response could not be parsed as JSON. Raw content (first 400 chars): {content[:400]!r}"
+                    f"Claude response could not be parsed as JSON and could not be "
+                    f"salvaged. Raw content (first 400 chars): {content[:400]!r}"
                 )
                 return EvalResult(reasoning="Error: could not parse evaluation response")
             return EvalResult(

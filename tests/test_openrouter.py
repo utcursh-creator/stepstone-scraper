@@ -122,6 +122,46 @@ async def test_evaluate_candidate_bare_fenced_json():
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_truncated_json_match_true_is_salvaged():
+    """A response truncated by the token limit (unterminated reasoning string)
+    must still recover match=true/confidence via regex, not be dropped as
+    match=False. Regression for the 0.92/0.85/0.75 matches lost on 2026-06-01.
+    """
+    truncated = (
+        '```json\n{\n  "match": true,\n  "confidence": 0.92,\n  '
+        '"reasoning": "Kandidatin hat relevante Berufserfahrung als '
+        'Rechtsanwaltsfachangestellte seit Januar 2024 bei Dr. Eick und Partner '
+        'und die Stellenbezeichnung passt exakt zur Zielposition. Wohnort Dortmund '
+        'liegt 31km'  # <-- cut off here, no closing quote/brace
+    )
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": [{"message": {"content": truncated}}]})
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test", candidate_text="x",
+        job_title="Rechtsanwaltsfachangestellte", location="Hamm", requirements="",
+    )
+    assert result.match is True
+    assert result.confidence == 0.92
+    assert "Rechtsanwaltsfachangestellte" in result.reasoning
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_truncated_json_match_false_is_salvaged():
+    truncated = '```json\n{"match": false, "confidence": 0.15, "reasoning": "Nur Ausbildung'
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": [{"message": {"content": truncated}}]})
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test", candidate_text="x", job_title="X", location="Y", requirements="",
+    )
+    assert result.match is False
+    assert result.confidence == 0.15
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_evaluate_candidate_malformed_response():
     respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
         return_value=httpx.Response(
