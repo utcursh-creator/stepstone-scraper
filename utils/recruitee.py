@@ -135,6 +135,29 @@ async def create_candidate(
     return candidate_id, placement_id
 
 
+# CV files arrive in several formats (PDF, Word, image). The MIME sent on upload
+# must match the real bytes or Recruitee stores an unopenable file — see the
+# scraper's _sniff_cv_type, which puts the correct extension on `filename`.
+_EXT_MIME = {
+    "pdf": "application/pdf",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "odt": "application/vnd.oasis.opendocument.text",
+    "rtf": "application/rtf",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
+def _mime_for_filename(filename: str) -> str:
+    """Map a filename's extension to its MIME type (octet-stream if unknown)."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return _EXT_MIME.get(ext, "application/octet-stream")
+
+
 async def upload_cv(
     token: str,
     company_id: str,
@@ -148,7 +171,7 @@ async def upload_cv(
     Uses PATCH /candidates/<id>/update_cv with multipart form data.
     """
     url = f"{RECRUITEE_API}/c/{company_id}/candidates/{candidate_id}/update_cv"
-    files = {"candidate[cv]": (filename, cv_bytes, "application/pdf")}
+    files = {"candidate[cv]": (filename, cv_bytes, _mime_for_filename(filename))}
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         try:
             await _patch_with_retry(client, url, files=files, headers=_headers(token))

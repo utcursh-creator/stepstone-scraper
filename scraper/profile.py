@@ -6,10 +6,13 @@ Based on live probing 2026-04-17:
 - Each profile unlock consumes one credit from the recruiter account
 """
 import base64
+import logging
 import re
 from patchright.async_api import Page
 from models.candidate import CandidateResult
 from utils.delays import human_delay
+
+logger = logging.getLogger(__name__)
 
 
 # Regex patterns for extracting structured fields from dialog text
@@ -62,18 +65,71 @@ async def _find_cv_link(dialog) -> tuple[str, str]:
     return href, filename
 
 
-async def _download_cv_bytes(page: Page, cv_url: str) -> str | None:
-    """Download CV via the authenticated browser session, return base64."""
+def _sniff_cv_type(buffer: bytes) -> tuple[str, str] | None:
+    """Detect (extension, mime_type) from a file's magic bytes.
+
+    Returns None when the bytes are not a usable document — empty, too small, or
+    an HTML error page (StepStone occasionally answers a download with an HTTP-200
+    interstitial). Sniffing exists because candidates upload CVs as PDF *or* Word
+    *or* image; storing a Word/image CV under a .pdf name + application/pdf MIME is
+    exactly why Recruitee could not open some scraped CVs.
+    """
+    if not buffer or len(buffer) < 64:
+        return None
+    head = buffer[:16]
+    if head[:4] == b"%PDF":
+        return ("pdf", "application/pdf")
+    if head[:3] == b"\xff\xd8\xff":
+        return ("jpg", "image/jpeg")
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return ("png", "image/png")
+    if head[:5] == b"{\\rtf":
+        return ("rtf", "application/rtf")
+    if head[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":  # OLE2 → legacy MS Office .doc
+        return ("doc", "application/msword")
+    if head[:4] == b"PK\x03\x04":  # zip container → OOXML (.docx) or ODF (.odt)
+        if b"opendocument.text" in buffer[:1024]:
+            return ("odt", "application/vnd.oasis.opendocument.text")
+        if b"word/" in buffer:
+            return ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        if b"xl/" in buffer:
+            return ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if b"ppt/" in buffer:
+            return ("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        # Unknown zip — for a CV the overwhelmingly likely case is a Word doc.
+        return ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    # Anything else (HTML interstitial, login page, garbage) is not a CV.
+    return None
+
+
+async def _download_cv_bytes(page: Page, cv_url: str) -> tuple[str, str] | None:
+    """Download the CV via the authenticated browser session.
+
+    Returns (base64_str, file_extension) where the extension is sniffed from the
+    real bytes, or None if the download failed or the bytes are not a usable
+    document. The caller uses the sniffed extension so the file is stored in
+    Recruitee with a correct name + MIME and stays openable.
+    """
     if not cv_url:
         return None
     try:
         response = await page.request.get(cv_url)
-        if response.ok:
-            buffer = await response.body()
-            return base64.b64encode(buffer).decode("utf-8")
+        if not response.ok:
+            return None
+        buffer = await response.body()
     except Exception:
-        pass
-    return None
+        return None
+    sniffed = _sniff_cv_type(buffer)
+    if sniffed is None:
+        logger.warning(
+            "CV download returned %d bytes that are not a recognised document "
+            "(first bytes: %r); treating as no CV.",
+            len(buffer),
+            buffer[:8],
+        )
+        return None
+    ext, _mime = sniffed
+    return base64.b64encode(buffer).decode("utf-8"), ext
 
 
 async def _close_dialog(page: Page) -> None:
@@ -147,16 +203,22 @@ async def extract_profile(
         if cv_url and cv_url.startswith("/"):
             cv_url = f"https://www.stepstone.de{cv_url}"
 
-        cv_base64 = await _download_cv_bytes(page, cv_url) if cv_url else None
+        downloaded = await _download_cv_bytes(page, cv_url) if cv_url else None
+        cv_base64 = None
+        cv_ext = "pdf"
+        if downloaded:
+            cv_base64, cv_ext = downloaded
 
-        # Build a safe filename using the candidate's name
+        # Build a safe filename using the candidate's name and the REAL file type
+        # (sniffed above) so Recruitee stores it with the correct extension/MIME
+        # and the CV stays openable — a Word/image CV named .pdf will not open.
         cv_filename = ""
         if cv_base64:
             if name:
                 safe_name = re.sub(r"[^a-zA-Z0-9äöüÄÖÜß]+", "_", name).strip("_")
-                cv_filename = f"{safe_name}_CV.pdf"
+                cv_filename = f"{safe_name}_CV.{cv_ext}"
             else:
-                cv_filename = cv_original_filename or "CV.pdf"
+                cv_filename = f"CV.{cv_ext}"
 
         return CandidateResult(
             name=name,
