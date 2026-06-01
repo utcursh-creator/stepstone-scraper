@@ -422,20 +422,21 @@ async def _set_page_size(page: Page, size: int = 50) -> bool:
     return False
 
 
-async def search_candidates(
+async def _execute_search(
     page: Page,
     job_title: str,
     location: str,
     max_distance_km: int = DEFAULT_RADIUS_KM,
     keywords: list[str] | None = None,
 ) -> tuple[list[SearchResult], int | None]:
-    """Search DirectSearch for candidates with structured location + radius.
+    """Run one DirectSearch pass (job_title + location + radius + keywords).
 
     Returns (results, used_radius_km). `used_radius_km` is the actual km
     applied to StepStone's backend (after rounding to the nearest available
     slider step), or None if the structured location filter could not be
     applied (city not in StepStone's gazetteer — caller falls back to local
-    distance gate only).
+    distance gate only). Wrapped by search_candidates(), which adds the
+    0-results keyword fallback.
     """
     await page.goto(DIRECTSEARCH_URL, wait_until="domcontentloaded", timeout=60000)
     await human_delay(2000, 3500)
@@ -506,4 +507,34 @@ async def search_candidates(
         f"backend_radius_km={used_radius_km}, structured_location={has_country}"
     )
 
+    return results, used_radius_km
+
+
+async def search_candidates(
+    page: Page,
+    job_title: str,
+    location: str,
+    max_distance_km: int = DEFAULT_RADIUS_KM,
+    keywords: list[str] | None = None,
+) -> tuple[list[SearchResult], int | None]:
+    """Search DirectSearch with structured location + radius + optional keywords.
+
+    Wraps _execute_search with a 0-results safety net: if a keyworded search
+    returns no cards, retry ONCE without keywords. This protects against a
+    keyword (or a leaked noise tag) over-narrowing the search to nothing — the
+    job still yields candidates the local gates can filter, instead of silently
+    producing zero. Search submissions cost no credits, so the retry is free.
+    """
+    results, used_radius_km = await _execute_search(
+        page, job_title, location, max_distance_km=max_distance_km, keywords=keywords
+    )
+    if not results and keywords:
+        logger.warning(
+            f"Keyworded search returned 0 cards (keywords={keywords}). "
+            f"Retrying WITHOUT keywords as a safety fallback."
+        )
+        results, used_radius_km = await _execute_search(
+            page, job_title, location, max_distance_km=max_distance_km, keywords=None
+        )
+        logger.info(f"Fallback search (no keywords) returned {len(results)} cards.")
     return results, used_radius_km

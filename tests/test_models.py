@@ -177,3 +177,99 @@ def test_jobinput_keywords_none_is_empty():
     j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
                  keywords=None)
     assert j.keywords == []
+
+
+# -- format-robustness: keywords arriving WITH hashtags / noise (Umair's tags) --
+
+def test_jobinput_keywords_strip_leading_hashtag():
+    # Umair will hashtag-prefix keyword tags: "#Wundversorgung"
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords=["#Wundversorgung", "#Wund", "#Wunden"])
+    assert j.keywords == ["Wundversorgung", "Wund", "Wunden"]
+
+
+def test_jobinput_keywords_hashtag_comma_string():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords="#Wundversorgung, #Wund, #Wunden")
+    assert j.keywords == ["Wundversorgung", "Wund", "Wunden"]
+
+
+def test_jobinput_keywords_drops_bensourcing_selector():
+    # If n8n forwards ALL hashtag tags, the selector #BenSourcing must not be searched
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords=["#BenSourcing", "#Wundversorgung"])
+    assert j.keywords == ["Wundversorgung"]
+
+
+def test_jobinput_keywords_drops_radius_token():
+    # A leaked "#50km" must not become a search keyword
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords=["#50km", "#Wund", "75 km"])
+    assert j.keywords == ["Wund"]
+
+
+def test_jobinput_keywords_double_hashtag():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y",
+                 keywords=["##ADTV", "#"])
+    assert j.keywords == ["ADTV"]
+
+
+# -- format-robustness: max_distance_km arriving as messy strings --
+
+def test_max_distance_int_passthrough():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", max_distance_km=50)
+    assert j.max_distance_km == 50
+
+
+def test_max_distance_numeric_string():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", max_distance_km="50")
+    assert j.max_distance_km == 50
+
+
+def test_max_distance_hash_km_string():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", max_distance_km="#50km")
+    assert j.max_distance_km == 50
+
+
+def test_max_distance_km_suffix_string():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", max_distance_km="75km")
+    assert j.max_distance_km == 75
+
+
+def test_max_distance_empty_defaults_25():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", max_distance_km="")
+    assert j.max_distance_km == 25
+
+
+def test_max_distance_none_defaults_25():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", max_distance_km=None)
+    assert j.max_distance_km == 25
+
+
+def test_max_distance_garbage_defaults_25():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", max_distance_km="keine Angabe")
+    assert j.max_distance_km == 25
+
+
+def test_max_distance_missing_defaults_25():
+    j = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y")
+    assert j.max_distance_km == 25
+
+
+def test_realworld_wundversorgung_job():
+    """The actual Pflegefachkraft Wundversorgung job: #50km + 3 keyword tags.
+
+    Models the worst case where n8n forwards every hashtag tag (including the
+    selector and the radius) into keywords. The scraper drops the selector and
+    radius token, strips hashtags, and keeps the real keywords.
+    """
+    j = JobInput(
+        offer_id="123", stage_id="456",
+        job_title="Pflegefachkraft Wundversorgung (m/w/d)",
+        location="Hannover",
+        max_distance_km="#50km",
+        keywords=["#BenSourcing", "#50km", "#Wundversorgung", "#Wund", "#Wunden"],
+    )
+    assert j.max_distance_km == 50
+    assert j.keywords == ["Wundversorgung", "Wund", "Wunden"]
+    assert not any(k.startswith("#") for k in j.keywords)
