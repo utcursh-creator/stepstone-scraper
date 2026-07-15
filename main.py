@@ -298,6 +298,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             )
             if is_dup:
                 logger.info(f"Skipping duplicate: {candidate.profile_id}")
+                result.candidates_skipped_pre_unlock += 1
                 continue
 
             # 4b. PRE-UNLOCK GATE 1: CV attachment check

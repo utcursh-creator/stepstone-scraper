@@ -32,6 +32,11 @@ class ScrapeResult(BaseModel):
     account_used: str
     candidates: list[CandidateResult] = []
     partial: bool = False
+    # Candidates skipped by the pre-unlock Airtable dedup (already processed in
+    # a previous run for this offer). They never enter `candidates`, so without
+    # this counter they are invisible in the webhook/Slack summary and an
+    # all-repeats run reads as "found nothing" instead of "nothing new".
+    candidates_skipped_pre_unlock: int = 0
 
     @computed_field
     @property

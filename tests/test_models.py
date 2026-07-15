@@ -273,3 +273,20 @@ def test_realworld_wundversorgung_job():
     assert j.max_distance_km == 50
     assert j.keywords == ["Wundversorgung", "Wund", "Wunden"]
     assert not any(k.startswith("#") for k in j.keywords)
+
+
+def test_skipped_pre_unlock_counter_serialized_in_webhook_payload():
+    """Pre-unlock dedup skips must survive model_dump so n8n can display them."""
+    from models.candidate import ScrapeResult
+
+    result = ScrapeResult(
+        offer_id="123",
+        stage_id="456",
+        job_title="Test",
+        location="Berlin",
+        account_used="Account 1",
+    )
+    assert result.candidates_skipped_pre_unlock == 0  # default
+    result.candidates_skipped_pre_unlock += 5
+    payload = result.model_dump()
+    assert payload["candidates_skipped_pre_unlock"] == 5
