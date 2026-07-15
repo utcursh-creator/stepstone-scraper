@@ -31,6 +31,7 @@ from urllib.parse import urlparse, parse_qs
 from patchright.async_api import Page
 
 from utils.delays import human_delay
+from utils.geocode import strip_ortsteil
 
 logger = logging.getLogger(__name__)
 
@@ -505,9 +506,26 @@ async def _execute_search(
     logger.info(f"Adding criterion job_title={clean_title!r} (orig: {job_title!r})")
     await _add_criterion_via_autosuggest(page, clean_title)
 
-    # 3. Add structured location criterion (defaults to 25 km radius)
-    logger.info(f"Adding criterion location={location!r}")
-    await _add_criterion_via_autosuggest(page, location)
+    # 3. Add structured location criterion (defaults to 25 km radius).
+    #    StepStone's Ort gazetteer holds municipalities, not districts, so a
+    #    "<Gemeinde> OT <Ortsteil>" job location matches nothing and the Ort
+    #    chip never renders — which silently drops the radius filter and turns
+    #    the search nationwide (prod 2026-07-15, offer 2468824: 'Wölfersheim OT
+    #    Wohnbach' returned physiotherapists 104-378 km away, and one in
+    #    Hungary, then paid to unlock five of them). Search the municipality
+    #    instead; strip_ortsteil is a no-op for every other location.
+    search_location = strip_ortsteil(location)
+    if search_location != location:
+        logger.info(
+            f"Location {location!r} names an Ortsteil, which StepStone cannot "
+            f"resolve; searching its municipality {search_location!r} instead "
+            f"so the radius filter stays active. main.py's distance gate "
+            f"measures against whichever form geocodes — for an Ortsteil that "
+            f"is normally the same municipality, so the two agree; where they "
+            f"differ it is by the Gemeinde/Ortsteil centroid offset (a few km)."
+        )
+    logger.info(f"Adding criterion location={search_location!r}")
+    await _add_criterion_via_autosuggest(page, search_location)
 
     # 4. Verify country chip rendered — if not, structured radius can't apply
     has_country = await _country_chip_present(page)
@@ -515,7 +533,7 @@ async def _execute_search(
 
     if not has_country:
         logger.warning(
-            f"No country/Ort chip rendered for location={location!r}. "
+            f"No country/Ort chip rendered for location={search_location!r}. "
             f"Likely cause: city not in StepStone's gazetteer. "
             f"Falling back to keyword-only filter; main.py distance gate "
             f"(max_distance_km={max_distance_km}) will reject far candidates."

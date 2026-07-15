@@ -32,6 +32,14 @@ class ScrapeResult(BaseModel):
     account_used: str
     candidates: list[CandidateResult] = []
     partial: bool = False
+    # Why the run did not complete normally, in operator language. `partial`
+    # alone is ambiguous — it means "unlock cap reached", "the scrape crashed"
+    # AND "the job's location can't be geocoded", which are three different
+    # actions for a human. Only the last one needs someone to go edit the
+    # Airtable row, and without this field that instruction reaches nobody:
+    # the webhook would carry candidates=[] and look identical to "found
+    # nothing". Empty string on a normal run.
+    error: str = ""
     # Candidates skipped by the pre-unlock Airtable dedup (already processed in
     # a previous run for this offer). They never enter `candidates`, so without
     # this counter they are invisible in the webhook/Slack summary and an

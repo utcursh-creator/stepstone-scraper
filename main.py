@@ -24,6 +24,8 @@ from utils.geocode import (
     extract_gewuenschte_arbeitsorte,
     calculate_distance_km,
     check_desired_location_match,
+    geocode_location,
+    strip_ortsteil,
     should_accept_far_candidate,
     DIST_TOO_FAR_FOR_RELOCATION,
 )
@@ -217,6 +219,45 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         account_used=account_label,
     )
 
+    # ================================================================
+    # PRE-FLIGHT: the job's own location must be geocodable.
+    # Every distance is haversine(candidate, job) — so if the JOB's town
+    # doesn't resolve, distance_km is None for every candidate no matter
+    # where they live, and the fail-closed gate below rejects all of them.
+    # The job cannot produce a single acceptable candidate; the only thing
+    # it can do is spend credits. Prod 2026-07-15 (offer 2468824,
+    # 'Wölfersheim OT Wohnbach'): 5 unlocked, 5 rejected, 5 credits gone,
+    # and each one mislabelled 'Ausland' though four lived in Germany.
+    # Bail before the browser, the proxy and the first credit.
+    # ================================================================
+    if geocode_location(job.location) is None:
+        # Deliberately does not assert the row is wrong: _geocode_query returns
+        # None both for "no such place" and for a transient Nominatim error
+        # (timeout / 503 / rate-limit), and this is now the first Nominatim
+        # call of the run. Name both causes so nobody edits a correct row
+        # because OSM had a bad minute. Retry-with-backoff is the real fix.
+        msg = (
+            f"Job location {job.location!r} could not be geocoded, so no candidate "
+            f"could pass the distance gate — aborting before any unlock. Either "
+            f"the location is wrong on the Airtable job row (a plain municipality "
+            f"resolves; a typo or a foreign town does not), or the geocoder was "
+            f"briefly unavailable. If the next run succeeds, it was the geocoder."
+        )
+        logger.error(msg)
+        result.partial = True
+        result.error = msg
+        current_status["error"] = msg
+        return result
+
+    # The municipality behind a possible Ortsteil, for the relocation signal
+    # below. check_desired_location_match asks whether the job's town appears
+    # in the candidate's Gewünschte Arbeitsorte — and candidates write
+    # "Wölfersheim", never "Wölfersheim OT Wohnbach", so the raw string never
+    # matches. That branch was unreachable while Ortsteil jobs had no distance
+    # at all; now that they do, matching on the raw string would silently
+    # reject every relocation candidate on those jobs as too_far_no_relocation.
+    job_location_base = strip_ortsteil(job.location)
+
     browser = None
     try:
         # 1. Launch browser
@@ -341,7 +382,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     distance_km=distance_km,
                     relocation_max_km=settings.relocation_max_distance_km,
                     gewuenschte_arbeitsorte=gewuenschte_str,
-                    job_location=job.location,
+                    job_location=job_location_base,
                 )
                 if not accepted:
                     too_far_for_relocate = (dist_reason == DIST_TOO_FAR_FOR_RELOCATION)
@@ -505,6 +546,15 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 #       a foreign location like 'Sidi bennour' (Morocco).
                 # Pre-2026-05-04 the code only handled (a) and silently let (b)
                 # through, pushing foreign candidates to Recruitee.
+                #
+                # Reading distance_km == None as "the CANDIDATE is unlocatable"
+                # is only sound because the pre-flight above proved the job's
+                # own location geocodes. Without it the same None also meant
+                # "the JOB's town is unresolvable", and this gate blamed the
+                # candidate for it — filing Germans from Mannheim and Leuna
+                # under 'Ausland' (prod 2026-07-15, offer 2468824). If you ever
+                # remove the pre-flight, this inference breaks and the label
+                # starts lying again.
                 # ============================================================
                 if distance_km is None:
                     post_unlock_addr = extract_wohnadresse(profile.profile_text) if profile.profile_text else None
@@ -536,7 +586,9 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             logger.warning(
                                 f"  LOCATION UNGEOCODABLE {candidate.profile_id}: "
                                 f"Wohnadresse={post_unlock_addr!r} did not geocode within "
-                                f"Germany (likely foreign address). Rejecting."
+                                f"Germany (likely foreign address). Job location "
+                                f"{job.location!r} geocoded fine, so the candidate's "
+                                f"address is what failed. Rejecting."
                             )
                             reason_text = (
                                 f"ABGELEHNT: Wohnadresse {post_unlock_addr} konnte nicht "
@@ -585,7 +637,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                             distance_km=distance_km,
                             relocation_max_km=settings.relocation_max_distance_km,
                             gewuenschte_arbeitsorte=gewuenschte_post,
-                            job_location=job.location,
+                            job_location=job_location_base,
                         )
                         if not accepted_post:
                             # Too far. Either no relocation signal at all, OR

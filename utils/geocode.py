@@ -30,18 +30,52 @@ def clear_cache() -> None:
     _geo_cache.clear()
 
 
-def _rate_limited_geocode(query: str) -> tuple[float, float] | None:
-    """Geocode a location string with Nominatim rate limiting (1 req/sec).
+# German job ads name a district as "<Gemeinde> OT <Ortsteil>" ("Wölfersheim OT
+# Wohnbach" = the Wohnbach district of Wölfersheim). No gazetteer holds that
+# composite as a place name — neither Nominatim nor StepStone's own Ort
+# lookup — so the whole string resolves to nothing.
+#
+# The \b is load-bearing, not decoration. Without it the literal "OT" matches
+# mid-word in an all-caps location and eats the rest of the string:
+# "ROT AM SEE" -> "R", "WÜSTENROT BADEN" -> "WÜSTENR". Rot am See and Rot an
+# der Rot are real Baden-Württemberg municipalities and models/job.py accepts
+# `location` as a bare str, so an all-caps Airtable row reaches this unaltered.
+# Case-sensitivity alone does NOT make lowercase names like "Otterndorf" safe —
+# only the word boundary does.
+_ORTSTEIL_RE = re.compile(r"\s*[/,]?\s*\b(?:OT|Ortsteil|ortsteil)\s+\S.*$")
+
+
+def strip_ortsteil(location: str) -> str:
+    """Reduce '<Gemeinde> OT <Ortsteil>' to '<Gemeinde>'.
+
+    Returns `location` unchanged when there is no Ortsteil suffix, so callers
+    can apply this unconditionally — only strings that are already unresolvable
+    change. Also returns the original if stripping would leave nothing (a bare
+    'OT Wohnbach' with no municipality).
+
+    Examples:
+      "Wölfersheim OT Wohnbach"        → "Wölfersheim"
+      "06242 Braunsbedra /OT Krumpa"   → "06242 Braunsbedra"
+      "Wettin-Löbejün OT Dobis"        → "Wettin-Löbejün"
+      "Neustadt (Ortsteil Mussbach)"   → "Neustadt"
+      "Warendorf"                      → "Warendorf"   (unchanged)
+      "ROT AM SEE"                     → "ROT AM SEE"  (unchanged)
+    """
+    if not location:
+        return location
+    # rstrip cleans up a separator the suffix left dangling, e.g. the opening
+    # paren of "Neustadt (Ortsteil Mussbach)".
+    stripped = _ORTSTEIL_RE.sub("", location).strip().rstrip(" (,/").strip()
+    return stripped or location
+
+
+def _geocode_query(query: str) -> tuple[float, float] | None:
+    """One rate-limited Nominatim lookup. No caching — see _rate_limited_geocode.
 
     Appends ', Deutschland' to disambiguate German cities (prevents 'Halle'
     matching Belgium, 'Frankfurt' matching Frankfurt an der Oder, etc.).
-    Returns (lat, lon) on success, None on failure.
     """
     global _last_geocode_time
-
-    cache_key = query.strip().lower()
-    if cache_key in _geo_cache:
-        return _geo_cache[cache_key]
 
     # Rate limit: Nominatim requires max 1 request per second
     now = time.time()
@@ -56,17 +90,51 @@ def _rate_limited_geocode(query: str) -> tuple[float, float] | None:
 
         if location:
             result = (location.latitude, location.longitude)
-            _geo_cache[cache_key] = result
             logger.info(f"Geocoded '{query}' -> ({result[0]:.4f}, {result[1]:.4f})")
             return result
-        else:
-            logger.warning(f"Geocoding failed for '{query}' - no results")
-            _geo_cache[cache_key] = None
-            return None
+        logger.warning(f"Geocoding failed for '{query}' - no results")
+        return None
     except Exception as e:
         logger.warning(f"Geocoding error for '{query}': {e}")
-        _geo_cache[cache_key] = None
         return None
+
+
+def _rate_limited_geocode(query: str) -> tuple[float, float] | None:
+    """Geocode a location string, falling back to its municipality on failure.
+
+    Returns (lat, lon) on success, None if neither the full string nor its
+    Ortsteil-stripped form resolves. Results (including None) are cached under
+    the original query for the lifetime of the run.
+
+    The fallback only fires after the full string has already failed, so a
+    location that geocodes today keeps its exact coordinates.
+    """
+    cache_key = query.strip().lower()
+    if cache_key in _geo_cache:
+        return _geo_cache[cache_key]
+
+    result = _geocode_query(query)
+
+    if result is None:
+        base = strip_ortsteil(query)
+        if base != query:
+            logger.info(
+                f"Retrying geocode for {query!r} without its Ortsteil suffix -> {base!r}"
+            )
+            result = _geocode_query(base)
+
+    _geo_cache[cache_key] = result
+    return result
+
+
+def geocode_location(location: str) -> tuple[float, float] | None:
+    """Resolve a place name to (lat, lon), or None if it cannot be resolved.
+
+    Public entry point for callers that need to know whether a location is
+    resolvable at all — e.g. main.run_scrape validating the job's own town
+    before spending any unlock credits.
+    """
+    return _rate_limited_geocode(location)
 
 
 def extract_wohnadresse(profile_text: str | None) -> str | None:
