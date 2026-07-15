@@ -464,6 +464,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                         company_id=settings.recruitee_company_id,
                         email=profile.email,
                         phone=profile.phone,
+                        name=profile.name,
                     )
                     if already_exists:
                         logger.info(

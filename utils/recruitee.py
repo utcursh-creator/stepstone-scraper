@@ -10,7 +10,18 @@ existing Recruitee candidates by EITHER email OR normalized phone. Email-only
 matching was insufficient because recruiters often enter a candidate manually
 using the email from the CV, while our StepStone scraper extracts the email
 the candidate registered on StepStone with — these can differ. Phone is the
-stable identifier across both data sources.
+stable identifier across both data sources. A third signal — exact normalized
+name PLUS a matching phone digit-suffix — catches duplicates whose phone
+formatting defeats _normalize_phone.
+
+Deliberately NOT a signal: name plus a "similar" email local-part. German
+addresses overwhelmingly follow vorname.nachname@provider, so a normalized
+local-part is a restatement of the name and carries no independent
+information — pairing the two is name-only matching in disguise, and would
+merge two unrelated people who share a common name. This gate runs AFTER the
+unlock, so a false merge silently discards a real candidate we already paid
+for. Always bias toward the split: a false split costs one duplicate row a
+recruiter deletes in seconds; a false merge costs a credit and the candidate.
 
 Each call retries up to MAX_RETRIES times with RETRY_DELAY_SECONDS backoff.
 """
@@ -260,6 +271,50 @@ async def _fetch_all_candidates(token: str, company_id: str) -> list[dict]:
 
 
 _PHONE_STRIP_RE = re.compile(r"[\s\-\(\)\.]+")
+_NAME_PUNCT_RE = re.compile(r"[.\-]+")
+_WHITESPACE_RE = re.compile(r"\s+")
+_NON_DIGIT_RE = re.compile(r"\D+")
+
+# Minimum digit-suffix overlap for the soft phone signal (name matching).
+PHONE_SUFFIX_MIN_DIGITS = 7
+
+_UMLAUT_FOLDS = (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss"))
+
+
+def _normalize_name(name: str | None) -> str:
+    """Normalize a person's full name for exact comparison.
+
+    Lowercase, strip, collapse internal whitespace, remove dots/hyphens,
+    fold German umlauts (ä→ae, ö→oe, ü→ue, ß→ss) so 'Müller' == 'Mueller'.
+
+    Examples:
+      "Max Mustermann"     → "max mustermann"
+      "  Max  MUSTERMANN " → "max mustermann"
+      "Hans-Peter Müller"  → "hanspeter mueller"
+      None / ""            → ""
+    """
+    if not name:
+        return ""
+    n = name.lower().strip()
+    for src, dst in _UMLAUT_FOLDS:
+        n = n.replace(src, dst)
+    n = _NAME_PUNCT_RE.sub("", n)
+    n = _WHITESPACE_RE.sub(" ", n).strip()
+    return n
+
+
+def _phone_suffix_match(a: str | None, b: str | None) -> bool:
+    """True if the last PHONE_SUFFIX_MIN_DIGITS digits of both phones match.
+
+    Compares digit-only forms, so formatting and country-prefix differences
+    that defeat _normalize_phone (e.g. '+49 (0) 171 ...' vs '0171 ...')
+    still corroborate. Both sides need at least the minimum digit count.
+    """
+    digits_a = _NON_DIGIT_RE.sub("", a or "")
+    digits_b = _NON_DIGIT_RE.sub("", b or "")
+    if len(digits_a) < PHONE_SUFFIX_MIN_DIGITS or len(digits_b) < PHONE_SUFFIX_MIN_DIGITS:
+        return False
+    return digits_a[-PHONE_SUFFIX_MIN_DIGITS:] == digits_b[-PHONE_SUFFIX_MIN_DIGITS:]
 
 
 def _normalize_phone(phone: str | None) -> str:
@@ -302,13 +357,27 @@ def _normalize_phone(phone: str | None) -> str:
     return stripped
 
 
+def _dedup_hit(candidate: dict, match_reason: str) -> tuple[bool, int | None, list[int]]:
+    """Log a dedup match and build the (True, candidate_id, offer_ids) result."""
+    existing_id = candidate.get("id")
+    placements = candidate.get("placements") or []
+    offer_ids = [p.get("offer_id") for p in placements if p.get("offer_id")]
+    logger.info(
+        f"Recruitee dedup HIT ({match_reason}): candidate_id={existing_id} "
+        f"(placements on offers: {offer_ids})"
+    )
+    return True, existing_id, offer_ids
+
+
 async def check_candidate_exists_in_recruitee(
     token: str,
     company_id: str,
     email: str | None = None,
     phone: str | None = None,
+    name: str = "",
 ) -> tuple[bool, int | None, list[int]]:
-    """Check if a candidate matching this email OR phone exists in Recruitee.
+    """Check if a candidate matching this email OR phone (or name + matching
+    phone suffix) exists in Recruitee.
 
     Returns (True, candidate_id, [offer_ids the candidate is placed on]) on
     match, or (False, None, []) if not found / on dedup fetch failure.
@@ -319,12 +388,28 @@ async def check_candidate_exists_in_recruitee(
       - Phone: normalized via _normalize_phone (strips separators, unifies
         German country-code variants to a single "0..." form), across the
         candidate's `phones` array.
+      - Name + phone digit-suffix (only checked when both exact signals miss,
+        and only when `name` is passed): normalized full name matches exactly
+        AND the last PHONE_SUFFIX_MIN_DIGITS digits of a phone match. A name
+        match with no phone corroboration is never a duplicate — two
+        different people who share a common name must not be merged.
 
-    Why both: a recruiter might add a candidate manually with the email
-    from their CV (e.g. aktuerk.b@hotmail.com), but our StepStone scraper
-    extracts the email the candidate registered with on StepStone (which
-    can differ). Phone is the stable identifier — it rarely changes across
-    a candidate's data-source representations.
+    Why email+phone: a recruiter might add a candidate manually with the
+    email from their CV, but our StepStone scraper extracts the email the
+    candidate registered with on StepStone (which can differ). Phone is the
+    stable identifier — it rarely changes across a candidate's data-source
+    representations.
+
+    Why the phone suffix and nothing softer: this gate runs AFTER the unlock,
+    so a false merge is unrecoverable — the credit is spent, the candidate is
+    never pushed, and the pre-unlock Airtable dedup skips them on every future
+    run. Seven trailing digits are independent evidence. A "similar" email
+    local-part is not: German addresses follow vorname.nachname@provider, so
+    the local-part restates the name and adds nothing. Requiring both would be
+    name-only matching, which merges unrelated people who share a name.
+    Known accepted gap: a genuine duplicate whose email AND phone both differ
+    across sources stays a duplicate — visible in Recruitee, and the recruiter
+    deletes the row in seconds. That is the cheaper error.
 
     Catches both manually-added candidates AND candidates placed on different
     offers in the past — anyone the recruiter has already seen.
@@ -336,9 +421,8 @@ async def check_candidate_exists_in_recruitee(
     email_lower = email.lower().strip() if email else None
     phone_norm = _normalize_phone(phone) if phone else ""
 
+    # Pass 1: exact signals (email / normalized phone)
     for candidate in candidates:
-        match_reason = None
-
         # Email match
         if email_lower:
             candidate_emails = [
@@ -346,30 +430,39 @@ async def check_candidate_exists_in_recruitee(
                 if isinstance(e, str)
             ]
             if email_lower in candidate_emails:
-                match_reason = f"email={email_lower!r}"
+                return _dedup_hit(candidate, f"email={email_lower!r}")
 
-        # Phone match (only if email didn't already hit)
-        if not match_reason and phone_norm:
+        # Phone match
+        if phone_norm:
             candidate_phones_norm = [
                 _normalize_phone(p) for p in (candidate.get("phones") or [])
                 if isinstance(p, str)
             ]
             candidate_phones_norm = [p for p in candidate_phones_norm if p]
             if phone_norm in candidate_phones_norm:
-                match_reason = f"phone={phone_norm!r}"
+                return _dedup_hit(candidate, f"phone={phone_norm!r}")
 
-        if match_reason:
-            existing_id = candidate.get("id")
-            placements = candidate.get("placements") or []
-            offer_ids = [p.get("offer_id") for p in placements if p.get("offer_id")]
-            logger.info(
-                f"Recruitee dedup HIT ({match_reason}): candidate_id={existing_id} "
-                f"(placements on offers: {offer_ids})"
-            )
-            return True, existing_id, offer_ids
+    # Pass 2: exact name + phone digit-suffix. Only reached when both exact
+    # signals missed on every candidate. The phone suffix must corroborate —
+    # a name match alone is never enough (see the docstring on why nothing
+    # softer, e.g. email local-part similarity, may be substituted here).
+    name_norm = _normalize_name(name)
+    if name_norm:
+        for candidate in candidates:
+            if _normalize_name(candidate.get("name")) != name_norm:
+                continue
+
+            if phone:
+                for cand_phone in (candidate.get("phones") or []):
+                    if isinstance(cand_phone, str) and _phone_suffix_match(phone, cand_phone):
+                        return _dedup_hit(
+                            candidate,
+                            f"name+phone-suffix (name={name_norm!r}, "
+                            f"phone={phone!r} ~ {cand_phone!r})",
+                        )
 
     logger.info(
-        f"Recruitee dedup MISS: email={email!r} phone={phone!r} "
+        f"Recruitee dedup MISS: email={email!r} phone={phone!r} name={name!r} "
         f"(phone_norm={phone_norm!r}) not found in {len(candidates)} candidates"
     )
     return False, None, []
