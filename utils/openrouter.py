@@ -42,17 +42,32 @@ EVALUATION RULES:
    set match=false. Look for the words "Praktikum", "Praktikant", "Trainee",
    "Werkstudent", "Ausbildung", "Volontariat", "Hospitanz" — if those are the only
    role-relevant entries on the candidate's CV/preview, REJECT.
-2. Match the candidate's current or recent FULL-TIME job title against the target.
-3. Consider location proximity (use the calculated distance shown below when
+2. CRITICAL — THE CANDIDATE'S OCCUPATION/FUNCTION MUST MATCH THE TARGET ROLE'S
+   FUNCTION. Sharing an industry, employer type, or keyword is NOT enough.
+   A candidate whose day-to-day job function differs from the target role's
+   function is NOT a match, no matter how much surface vocabulary overlaps:
+   - A driver (Fahrer, e.g. LKW-Fahrer) is NOT a mechanic (Mechaniker,
+     e.g. LKW-Mechaniker) — both mention "LKW", but driving a truck is a
+     different occupation from repairing one.
+   - A salesperson (Verkäufer/in, e.g. Bäckereifachverkäuferin) is NOT a
+     producer/craftsman (e.g. Bäcker) — selling baked goods is not baking them.
+   - An assistant is NOT a specialist in the same field.
+   - Working WITH a system or product (operating/using it) is NOT the same as
+     servicing, repairing, or consulting on it.
+   If the candidate's core function differs from the role's core function, set
+   match=false regardless of industry overlap or keyword hits.
+3. Match the candidate's current or recent FULL-TIME job title against the target.
+4. Consider location proximity (use the calculated distance shown below when
    provided; do NOT estimate distances yourself).
-4. Short tenure in a real full-time role is acceptable — 1-2 months in a regular
+5. Short tenure in a real full-time role is acceptable — 1-2 months in a regular
    position can signal probation-period openness to new opportunities. But a short
    tenure that is itself labeled Praktikum/Ausbildung/Trainee does NOT qualify
    under Rule 1.
-5. Focus on role alignment, not exact keyword matching, but require evidence of
+6. Focus on role alignment, not exact keyword matching, but require evidence of
    actual professional work in the field — not aspirational, not in-training,
-   not as a side-project.
-6. Make a defensible call. Do NOT default to match without clear professional
+   not as a side-project. Role alignment means FUNCTION alignment (Rule 2), not
+   industry proximity.
+7. Make a defensible call. Do NOT default to match without clear professional
    evidence in the target role. If you have to argue yourself into a match
    ("they might have done X..."), that's a REJECT.
 

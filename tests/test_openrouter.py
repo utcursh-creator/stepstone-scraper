@@ -2,7 +2,7 @@ import json
 import pytest
 import httpx
 import respx
-from utils.openrouter import evaluate_candidate, EvalResult
+from utils.openrouter import EVAL_PROMPT, evaluate_candidate, EvalResult
 
 
 @respx.mock
@@ -273,3 +273,80 @@ async def test_prompt_contains_internship_rejection_rule():
     # And NOT contain the old "lean toward MATCH" instruction
     assert "lean toward MATCH" not in prompt
     assert "cast a wide net" not in prompt
+
+
+def test_prompt_contains_occupation_function_rule():
+    """The prompt must enforce occupation/function match, not just industry/keyword
+    overlap.
+
+    Regression test for the LKW-Fahrer matched to an LKW Mechaniker job with
+    confidence 0.75 — both profiles said "LKW", but a driver is not a mechanic.
+    Recruiter Umair asked that candidates whose actual occupation differs from
+    the target role be rejected even when they share an industry or keyword.
+    """
+    # Function-vs-industry wording
+    assert "FUNCTION" in EVAL_PROMPT
+    assert "industry" in EVAL_PROMPT
+    # Concrete driver-vs-mechanic contrast (the LKW case)
+    assert "Fahrer" in EVAL_PROMPT
+    assert "Mechaniker" in EVAL_PROMPT
+    # Salesperson-vs-producer contrast
+    assert "Verkäufer" in EVAL_PROMPT
+    assert "Bäcker" in EVAL_PROMPT
+    # Assistant-vs-specialist and using-vs-servicing contrasts
+    assert "assistant" in EVAL_PROMPT.lower()
+    assert "specialist" in EVAL_PROMPT.lower()
+    # Explicit consequence: differing core function -> match=false
+    assert "match=false" in EVAL_PROMPT
+    assert "keyword" in EVAL_PROMPT
+
+
+def test_eval_prompt_format_placeholders_intact():
+    """EVAL_PROMPT.format(...) with the exact kwargs used in evaluate_candidate
+    must render without KeyError/IndexError — guards against prompt edits that
+    add un-doubled literal braces or rename/remove placeholders.
+    """
+    rendered = EVAL_PROMPT.format(
+        job_title="LKW Mechaniker (m/w/d)",
+        location="Bendestorf",
+        requirements="Erfahrung als Mechaniker",
+        location_context="",
+        candidate_text="LKW-Fahrer im Fernverkehr seit 2019",
+    )
+    assert "LKW Mechaniker (m/w/d)" in rendered
+    assert "Bendestorf" in rendered
+    assert "LKW-Fahrer im Fernverkehr seit 2019" in rendered
+    # The literal JSON format instruction must survive formatting with single braces
+    assert '{"match": true/false' in rendered
+    # No unresolved placeholders left behind
+    assert "{job_title}" not in rendered
+    assert "{candidate_text}" not in rendered
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_sent_prompt_contains_occupation_function_rule():
+    """The prompt actually sent to OpenRouter carries the occupation-strictness
+    rule (mirrors test_prompt_contains_internship_rejection_rule)."""
+    route = respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"match": false, "confidence": 0.2, "reasoning": "Fahrer, kein Mechaniker"}'}}]},
+        )
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test",
+        candidate_text="LKW-Fahrer im Fernverkehr, 8 Jahre Erfahrung",
+        job_title="LKW Mechaniker (m/w/d)",
+        location="Bendestorf",
+        requirements="Wartung und Reparatur von LKW",
+    )
+    assert result.match is False
+    sent_body = route.calls[0].request.read()
+    import json as _json
+    payload = _json.loads(sent_body)
+    prompt = payload["messages"][0]["content"]
+    assert "Fahrer" in prompt
+    assert "Mechaniker" in prompt
+    assert "match=false" in prompt
+    assert "industry" in prompt
