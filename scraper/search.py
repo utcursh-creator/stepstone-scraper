@@ -70,6 +70,21 @@ def _strip_gender_marker(text: str) -> str:
     return _GENDER_MARKER_RE.sub(" ", text or "").strip()
 
 
+# Patchright raises this when StepStone re-navigates mid-scrape (observed in
+# prod 2026-07-03, 'LKW Mechaniker in Bendestorf': Page.query_selector_all
+# failed with "Execution context was destroyed, most likely because of a
+# navigation." and the whole job aborted with 0 candidates + stack trace).
+CONTEXT_DESTROYED_SNIPPET = "execution context was destroyed"
+
+
+def is_context_destroyed_error(error: BaseException | str) -> bool:
+    """True iff `error`'s message indicates a destroyed execution context
+    (i.e. the page navigated away mid-operation). Deliberately narrow — we
+    only retry/soften THIS failure mode, never blanket-catch."""
+    msg = error if isinstance(error, str) else str(error)
+    return CONTEXT_DESTROYED_SNIPPET in (msg or "").lower()
+
+
 class SearchResult:
     def __init__(
         self,
@@ -240,15 +255,50 @@ async def _scrape_cards(page: Page) -> list[SearchResult]:
     return results
 
 
+async def _scrape_cards_guarded(page: Page) -> list[SearchResult]:
+    """_scrape_cards with ONE retry when StepStone re-navigates mid-scrape.
+
+    Prod 2026-07-03 ('LKW Mechaniker in Bendestorf'): patchright raised
+    'Execution context was destroyed, most likely because of a navigation.'
+    inside _scrape_cards and the whole request crashed with a stack trace,
+    skipping nothing but looking like a hard failure. Behavior here:
+      - matching error on first attempt → WARNING, wait ~2-3s, retry once
+      - matching error again → ERROR, return [] (preserves the existing
+        'send 0 candidates' flow, incl. the webhook, without a stack trace)
+      - any OTHER exception → propagates unchanged (no blanket catch)
+    """
+    try:
+        return await _scrape_cards(page)
+    except Exception as e:
+        if not is_context_destroyed_error(e):
+            raise
+        logger.warning(
+            f"Card scrape interrupted by a page navigation "
+            f"(execution context destroyed): {e}. Waiting and retrying once."
+        )
+        await human_delay(2000, 3000)
+        try:
+            return await _scrape_cards(page)
+        except Exception as retry_err:
+            if not is_context_destroyed_error(retry_err):
+                raise
+            logger.error(
+                f"Card scrape retry also hit a destroyed execution context: "
+                f"{retry_err}. Returning 0 candidates for this search pass."
+            )
+            return []
+
+
 async def _add_criterion_via_autosuggest(page: Page, term: str) -> None:
-    """Type `term` into the search field, wait for autosuggest, ArrowDown to
-    highlight the first match, Enter to commit it as a structured criterion.
+    """Type `term` into the search field, wait for autosuggest, then commit the
+    first suggestion via ArrowDown+Enter.
 
     Why ArrowDown then Enter: the probe confirmed that pressing Enter without
     arrow-navigating leaves all autosuggest items unhighlighted, and StepStone
     treats that as a free-text keyword commit (the bug the old scraper had).
-    One ArrowDown highlights the first item — for cities, that's section-country
-    (Ort/Wohnort); for job titles, section-job_title; for unknowns, section-keyword.
+    One ArrowDown highlights the first item — for cities, that's
+    section-country (Ort/Wohnort); for job titles, section-job_title; for
+    unknowns, section-keyword.
 
     Field clear is REQUIRED — StepStone does NOT auto-clear after Enter, so
     typing the next criterion without `field.fill('')` produces a concatenated
@@ -268,6 +318,7 @@ async def _add_criterion_via_autosuggest(page: Page, term: str) -> None:
         await field.type(ch, delay=80)
 
     await human_delay(2000, 3000)  # autosuggest debounce + render
+
     await field.press("ArrowDown")
     await human_delay(300, 600)
     await field.press("Enter")
@@ -497,8 +548,8 @@ async def _execute_search(
     await human_delay(8000, 12000)
     await _kill_cookie_banner(page)
 
-    # 8. Scrape
-    results = await _scrape_cards(page)
+    # 8. Scrape (guarded: retries once if StepStone re-navigates mid-scrape)
+    results = await _scrape_cards_guarded(page)
     with_wohnort = sum(1 for r in results if r.wohnort)
     with_cv = sum(1 for r in results if r.has_cv_attachment)
     logger.info(
