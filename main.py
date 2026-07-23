@@ -52,6 +52,14 @@ current_status: dict = {"state": "idle", "job": None, "error": None}
 COUNTER_PATH = os.path.join("state", "account_counter.json")
 UNLOCK_COUNTER_PATH = os.path.join("state", "unlock_counter.json")
 
+# Abort a job after this many CONSECUTIVE eval errors. One timeout is transient
+# and just skips a candidate; a run of them means the evaluator is systemically
+# down (e.g. OpenRouter 402 — account out of funds), so there is no point
+# walking the rest of the cards. No candidate is ever burned either way —
+# errored candidates are never emitted — this only stops wasting the browser
+# session and puts the reason in the webhook `error` for Slack.
+EVAL_ERROR_ABORT_THRESHOLD = 3
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -322,6 +330,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             f"(job requested {job.max_candidates}, server cap {settings.max_candidates_per_job})"
         )
         processed = 0
+        consecutive_eval_errors = 0
         for candidate in candidates:
             if processed >= effective_max_candidates:
                 logger.info(
@@ -441,6 +450,38 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             )
             logger.info(f"  eval match={eval_result.match} conf={eval_result.confidence} reason={eval_result.reasoning[:150]}")
             await asyncio.sleep(1.0)  # Rate limit: 1 eval/sec
+
+            # 4d-guard: an eval ERROR is not a verdict. If OpenRouter errored
+            # (402/5xx/timeout/transport/unparseable) we never got the model's
+            # judgment, so this candidate must NOT be emitted. Appending it as
+            # match=False would send it to the webhook, n8n would log it to the
+            # Airtable dedup table, and it would be skipped forever — never
+            # getting a real evaluation. Leave it un-processed (don't append,
+            # don't count against the cap) so the next run re-evaluates it.
+            # Prod 2026-07-22: OpenRouter 402'd every call; this branch is what
+            # keeps that outage from silently burning candidates.
+            if eval_result.error:
+                result.candidates_eval_failed += 1
+                consecutive_eval_errors += 1
+                logger.warning(
+                    f"  EVAL ERROR for {candidate.profile_id}: {eval_result.reasoning} "
+                    f"— not emitting; will be re-evaluated next run "
+                    f"({consecutive_eval_errors} consecutive)."
+                )
+                if consecutive_eval_errors >= EVAL_ERROR_ABORT_THRESHOLD:
+                    msg = (
+                        f"AI evaluation unavailable: {consecutive_eval_errors} consecutive "
+                        f"OpenRouter errors ({eval_result.reasoning}). Aborting the job so no "
+                        f"further cards are wasted; the rest are left un-evaluated for the next "
+                        f"run. Most likely the OpenRouter account is out of funds."
+                    )
+                    logger.error(msg)
+                    result.error = msg
+                    result.partial = True
+                    break
+                continue
+
+            consecutive_eval_errors = 0
 
             if not eval_result.match:
                 result.candidates.append(

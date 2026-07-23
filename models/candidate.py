@@ -45,6 +45,15 @@ class ScrapeResult(BaseModel):
     # this counter they are invisible in the webhook/Slack summary and an
     # all-repeats run reads as "found nothing" instead of "nothing new".
     candidates_skipped_pre_unlock: int = 0
+    # Candidates whose AI evaluation could not be OBTAINED (OpenRouter error /
+    # timeout / outage) — as distinct from genuinely not matching. They are
+    # deliberately kept OUT of `candidates`: an errored eval is "we don't know
+    # yet", so the candidate is left un-processed and re-evaluated next run,
+    # rather than emitted, logged to the dedup table by n8n, and skipped
+    # forever. Surfaced so a run that silently fails every eval (prod
+    # 2026-07-22: OpenRouter 402) is visible in Slack instead of reading as
+    # a plain zero. See main.run_scrape and utils.openrouter.EvalResult.error.
+    candidates_eval_failed: int = 0
 
     @computed_field
     @property

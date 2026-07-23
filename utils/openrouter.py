@@ -80,6 +80,18 @@ class EvalResult(BaseModel):
     match: bool = False
     confidence: float = 0.0
     reasoning: str = ""
+    # True when the evaluation could NOT be obtained (HTTP error, timeout,
+    # transport failure, unparseable response) — as opposed to a genuine
+    # match=False *verdict* from the model. The distinction is load-bearing:
+    # the caller must not treat an errored eval as "not a match". Doing so emits
+    # the candidate downstream, n8n logs it to the Airtable dedup table, and the
+    # candidate is then skipped forever — never getting a real evaluation. An
+    # errored candidate must instead be left un-processed so the next run
+    # re-evaluates it. Prod 2026-07-22: OpenRouter returned 402 on every call
+    # and, without this flag, silently burned that whole week's candidates.
+    # A salvaged verdict (truncated-but-recovered JSON) is a real verdict, so it
+    # keeps error=False.
+    error: bool = False
 
 
 def _extract_json(content: str) -> str:
@@ -208,7 +220,7 @@ async def evaluate_candidate(
                     f"Claude response could not be parsed as JSON and could not be "
                     f"salvaged. Raw content (first 400 chars): {content[:400]!r}"
                 )
-                return EvalResult(reasoning="Error: could not parse evaluation response")
+                return EvalResult(error=True, reasoning="Error: could not parse evaluation response")
             return EvalResult(
                 match=bool(data.get("match", False)),
                 confidence=float(data.get("confidence", 0.0)),
@@ -216,8 +228,26 @@ async def evaluate_candidate(
             )
         except KeyError as e:
             logger.warning(f"Unexpected OpenRouter response shape: missing key {e}")
-            return EvalResult(reasoning="Error: unexpected response shape from OpenRouter")
+            return EvalResult(error=True, reasoning="Error: unexpected response shape from OpenRouter")
         except httpx.HTTPStatusError as e:
-            return EvalResult(reasoning=f"Error: OpenRouter returned {e.response.status_code}")
+            logger.warning(f"OpenRouter HTTP {e.response.status_code} for eval")
+            return EvalResult(error=True, reasoning=f"Error: OpenRouter returned {e.response.status_code}")
         except httpx.TimeoutException:
-            return EvalResult(reasoning="Error: evaluation timed out")
+            return EvalResult(error=True, reasoning="Error: evaluation timed out")
+        except httpx.RequestError as e:
+            # Connection refused, DNS failure, read error, etc. Without this the
+            # exception would propagate and crash the whole job; instead it is a
+            # skippable eval error, same as any other transport failure.
+            logger.warning(f"OpenRouter transport error for eval: {type(e).__name__}: {e}")
+            return EvalResult(error=True, reasoning=f"Error: could not reach OpenRouter ({type(e).__name__})")
+        except (ValueError, IndexError, TypeError, AttributeError) as e:
+            # We got a 200 but couldn't turn it into a verdict: malformed HTTP
+            # envelope (response.json() raising), empty `choices` (IndexError),
+            # a non-dict body (AttributeError on .get), or a non-numeric
+            # confidence (float() ValueError). Same error=True convention — a
+            # skippable "we don't know", NOT a disguised match=False, and NOT an
+            # exception that crashes the whole job. (The inner json.loads of the
+            # model's own content is handled separately above via the salvage
+            # path; this covers the envelope/extraction around it.)
+            logger.warning(f"OpenRouter response not usable as a verdict: {type(e).__name__}: {e}")
+            return EvalResult(error=True, reasoning=f"Error: unusable OpenRouter response ({type(e).__name__})")

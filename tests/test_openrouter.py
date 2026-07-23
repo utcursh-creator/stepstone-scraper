@@ -144,6 +144,7 @@ async def test_truncated_json_match_true_is_salvaged():
     assert result.match is True
     assert result.confidence == 0.92
     assert "Rechtsanwaltsfachangestellte" in result.reasoning
+    assert result.error is False, "a salvaged verdict is a real verdict, not an error"
 
 
 @respx.mock
@@ -158,6 +159,7 @@ async def test_truncated_json_match_false_is_salvaged():
     )
     assert result.match is False
     assert result.confidence == 0.15
+    assert result.error is False, "a salvaged match=false is a verdict, not an error"
 
 
 @respx.mock
@@ -180,6 +182,86 @@ async def test_evaluate_candidate_malformed_response():
     assert result.match is False
     assert result.confidence == 0.0
     assert "parse" in result.reasoning.lower() or "error" in result.reasoning.lower()
+    assert result.error is True, "an unparseable, unsalvageable response is an error, not a verdict"
+
+
+# -- the error flag: an eval that could not be OBTAINED must be distinguishable
+#    from a genuine match=False verdict, so the caller never emits (and n8n never
+#    logs) a candidate that was silently burned by an outage. Prod 2026-07-22. --
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_402_payment_required_sets_error_flag():
+    """The exact prod failure: OpenRouter out of funds → 402 on every call.
+    Must come back error=True, NOT a match=False verdict."""
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(402, json={"error": "Insufficient credits"})
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test", candidate_text="strong candidate",
+        job_title="X", location="Y", requirements="",
+    )
+    assert result.error is True
+    assert result.match is False
+    assert "402" in result.reasoning
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_timeout_sets_error_flag():
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        side_effect=httpx.TimeoutException("timed out")
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test", candidate_text="x", job_title="X", location="Y", requirements="",
+    )
+    assert result.error is True
+    assert result.match is False
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_transport_error_sets_error_flag():
+    """A connection failure must be a skippable eval error, not an unhandled
+    exception that crashes the whole job."""
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test", candidate_text="x", job_title="X", location="Y", requirements="",
+    )
+    assert result.error is True
+    assert result.match is False
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_non_json_envelope_sets_error_flag():
+    """A 200 whose BODY isn't JSON (e.g. an HTML error page from a proxy) must
+    be a skippable eval error, not an exception that crashes the whole job."""
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, text="<html>502 Bad Gateway</html>")
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test", candidate_text="x", job_title="X", location="Y", requirements="",
+    )
+    assert result.error is True
+    assert result.match is False
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_empty_choices_sets_error_flag():
+    """A 200 with an empty `choices` array (IndexError on [0]) must be a
+    skippable eval error, not a job-crashing exception."""
+    respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": []})
+    )
+    result = await evaluate_candidate(
+        api_key="sk-test", candidate_text="x", job_title="X", location="Y", requirements="",
+    )
+    assert result.error is True
+    assert result.match is False
 
 
 @respx.mock
