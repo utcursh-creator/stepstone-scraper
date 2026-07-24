@@ -1,4 +1,5 @@
 import os
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -14,7 +15,20 @@ class Settings(BaseSettings):
     stepstone_email_2: str = ""
     stepstone_pass_2: str = ""
 
-    openrouter_api_key: str
+    # LLM evaluator (candidate matching). Defaults call OpenRouter with Claude
+    # Haiku — the model the eval prompt (utils/openrouter.py) is tuned against.
+    # To use a different provider — e.g. the client's own OpenAI account on
+    # their instance — set LLM_BASE_URL to that provider's chat-completions
+    # endpoint and LLM_MODEL to one of its models. Both providers speak the same
+    # OpenAI-style request/response shape, so only these three values change.
+    #   OpenAI:  LLM_BASE_URL=https://api.openai.com/v1/chat/completions
+    #            LLM_MODEL=gpt-4o-mini   (a standard chat model, not an o-series
+    #            reasoning model — those reject the max_tokens field we send)
+    # LLM_API_KEY holds the key; OPENROUTER_API_KEY is still accepted as an
+    # alias so existing deployments keep working with no env change.
+    llm_api_key: str = Field(validation_alias=AliasChoices("LLM_API_KEY", "OPENROUTER_API_KEY"))
+    llm_base_url: str = "https://openrouter.ai/api/v1/chat/completions"
+    llm_model: str = "anthropic/claude-haiku-4-5"
 
     airtable_pat: str
     airtable_base_id: str

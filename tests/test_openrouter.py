@@ -264,6 +264,56 @@ async def test_empty_choices_sets_error_flag():
     assert result.match is False
 
 
+# -- provider is configurable: the same client can target any OpenAI-compatible
+#    endpoint (OpenRouter default, or OpenAI directly) via base_url + model. --
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_base_url_and_model_are_routed_to_the_given_provider():
+    """Passing base_url + model must send the request THERE with THAT model —
+    this is what lets the client's instance run on their own OpenAI account
+    instead of OpenRouter. The default OpenRouter URL must NOT be called."""
+    openrouter_route = respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+    )
+    openai_route = respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(
+                {"match": True, "confidence": 0.8, "reasoning": "passt"})}}]},
+        )
+    )
+    result = await evaluate_candidate(
+        api_key="sk-openai-test", candidate_text="Physiotherapeut, 4 Jahre",
+        job_title="Physiotherapeut", location="Berlin", requirements="",
+        base_url="https://api.openai.com/v1/chat/completions", model="gpt-4o-mini",
+    )
+    assert result.match is True and result.error is False
+    assert openai_route.called and not openrouter_route.called, "must hit OpenAI, not OpenRouter"
+    body = json.loads(openai_route.calls[0].request.content)
+    assert body["model"] == "gpt-4o-mini", "the configured model must be sent"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_default_provider_is_openrouter_claude():
+    """With no base_url/model override, the default is unchanged: OpenRouter +
+    Claude Haiku — so existing deployments behave exactly as before."""
+    route = respx.post("https://openrouter.ai/api/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(
+                {"match": False, "confidence": 0.1, "reasoning": "nein"})}}]},
+        )
+    )
+    await evaluate_candidate(
+        api_key="or-test", candidate_text="x", job_title="X", location="Y", requirements="",
+    )
+    assert route.called
+    body = json.loads(route.calls[0].request.content)
+    assert body["model"] == "anthropic/claude-haiku-4-5"
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_evaluate_candidate_with_distance_data():

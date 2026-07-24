@@ -438,7 +438,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 f"wohnort={wohnort or 'unknown'}, distance={distance_km}km)"
             )
             eval_result = await evaluate_candidate(
-                api_key=settings.openrouter_api_key,
+                api_key=settings.llm_api_key,
                 candidate_text=candidate.preview_text,
                 job_title=job.job_title,
                 location=job.location,
@@ -447,6 +447,8 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 wohnadresse=wohnort,
                 gewuenschte_arbeitsorte=gewuenschte_str,
                 max_distance_km=job.max_distance_km,
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
             )
             logger.info(f"  eval match={eval_result.match} conf={eval_result.confidence} reason={eval_result.reasoning[:150]}")
             await asyncio.sleep(1.0)  # Rate limit: 1 eval/sec
@@ -471,9 +473,10 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 if consecutive_eval_errors >= EVAL_ERROR_ABORT_THRESHOLD:
                     msg = (
                         f"AI evaluation unavailable: {consecutive_eval_errors} consecutive "
-                        f"OpenRouter errors ({eval_result.reasoning}). Aborting the job so no "
+                        f"evaluator errors ({eval_result.reasoning}). Aborting the job so no "
                         f"further cards are wasted; the rest are left un-evaluated for the next "
-                        f"run. Most likely the OpenRouter account is out of funds."
+                        f"run. Check the AI provider (LLM_BASE_URL) — likely out of funds, a bad "
+                        f"key, or an unsupported model."
                     )
                     logger.error(msg)
                     result.error = msg

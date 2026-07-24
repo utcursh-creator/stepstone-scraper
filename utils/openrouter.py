@@ -1,12 +1,18 @@
 import json
 import logging
 import re
+from urllib.parse import urlparse
+
 import httpx
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-MODEL = "anthropic/claude-haiku-4-5"
+# Defaults: OpenRouter + Claude Haiku (the model the prompt below is tuned
+# against). Both are overridable per-call so the same client can talk to any
+# OpenAI-compatible provider (e.g. OpenAI directly) — see models.config.
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
 # 300 was too small: the German reasoning routinely ran past it, the JSON got
 # truncated mid-string, json.loads failed, and genuine match=true candidates
 # (seen 0.92/0.85/0.75 on 2026-06-01) were dropped as match=False. 1000 gives
@@ -168,12 +174,19 @@ async def evaluate_candidate(
     wohnadresse: str | None = None,
     gewuenschte_arbeitsorte: str | None = None,
     max_distance_km: int = 200,
+    base_url: str = DEFAULT_BASE_URL,
+    model: str = DEFAULT_MODEL,
 ) -> EvalResult:
-    """Evaluate a candidate using Claude Haiku 4.5 via OpenRouter.
+    """Evaluate a candidate via an OpenAI-compatible chat-completions endpoint.
+
+    Defaults to OpenRouter + Claude Haiku 4.5 (the model this prompt is tuned
+    against). `base_url` and `model` let the caller target any OpenAI-compatible
+    provider — e.g. OpenAI directly — without changing anything else, since the
+    request/response shape is identical across them.
 
     When distance_km and wohnadresse are provided, a LOCATION DATA block is
-    injected into the prompt so Claude can make an informed distance decision.
-    When they are None, the prompt is identical to the original behaviour.
+    injected into the prompt so the model can make an informed distance
+    decision. When they are None, the prompt is identical to the original.
     """
     location_context = _build_location_context(
         distance_km=distance_km,
@@ -190,13 +203,19 @@ async def evaluate_candidate(
         candidate_text=candidate_text,
     )
 
+    # Human-readable provider label for error/log messages, derived from the
+    # configured endpoint — so on the client's OpenAI instance an error reads
+    # "api.openai.com returned 401", not a misleading "OpenRouter" (which would
+    # send their operator chasing the wrong provider).
+    provider = urlparse(base_url).netloc or "the LLM provider"
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
+                base_url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    "model": MODEL,
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": MAX_TOKENS,
                 },
@@ -211,13 +230,13 @@ async def evaluate_candidate(
                 salvaged = _salvage_eval(content)
                 if salvaged is not None:
                     logger.warning(
-                        f"Claude JSON did not parse (likely truncated); salvaged "
+                        f"Model JSON did not parse (likely truncated); salvaged "
                         f"match={salvaged.match} conf={salvaged.confidence}. "
                         f"Raw (first 200): {content[:200]!r}"
                     )
                     return salvaged
                 logger.warning(
-                    f"Claude response could not be parsed as JSON and could not be "
+                    f"Model response could not be parsed as JSON and could not be "
                     f"salvaged. Raw content (first 400 chars): {content[:400]!r}"
                 )
                 return EvalResult(error=True, reasoning="Error: could not parse evaluation response")
@@ -227,19 +246,19 @@ async def evaluate_candidate(
                 reasoning=str(data.get("reasoning", "")),
             )
         except KeyError as e:
-            logger.warning(f"Unexpected OpenRouter response shape: missing key {e}")
-            return EvalResult(error=True, reasoning="Error: unexpected response shape from OpenRouter")
+            logger.warning(f"Unexpected {provider} response shape: missing key {e}")
+            return EvalResult(error=True, reasoning=f"Error: unexpected response shape from {provider}")
         except httpx.HTTPStatusError as e:
-            logger.warning(f"OpenRouter HTTP {e.response.status_code} for eval")
-            return EvalResult(error=True, reasoning=f"Error: OpenRouter returned {e.response.status_code}")
+            logger.warning(f"{provider} HTTP {e.response.status_code} for eval")
+            return EvalResult(error=True, reasoning=f"Error: {provider} returned {e.response.status_code}")
         except httpx.TimeoutException:
             return EvalResult(error=True, reasoning="Error: evaluation timed out")
         except httpx.RequestError as e:
             # Connection refused, DNS failure, read error, etc. Without this the
             # exception would propagate and crash the whole job; instead it is a
             # skippable eval error, same as any other transport failure.
-            logger.warning(f"OpenRouter transport error for eval: {type(e).__name__}: {e}")
-            return EvalResult(error=True, reasoning=f"Error: could not reach OpenRouter ({type(e).__name__})")
+            logger.warning(f"{provider} transport error for eval: {type(e).__name__}: {e}")
+            return EvalResult(error=True, reasoning=f"Error: could not reach {provider} ({type(e).__name__})")
         except (ValueError, IndexError, TypeError, AttributeError) as e:
             # We got a 200 but couldn't turn it into a verdict: malformed HTTP
             # envelope (response.json() raising), empty `choices` (IndexError),
@@ -249,5 +268,5 @@ async def evaluate_candidate(
             # exception that crashes the whole job. (The inner json.loads of the
             # model's own content is handled separately above via the salvage
             # path; this covers the envelope/extraction around it.)
-            logger.warning(f"OpenRouter response not usable as a verdict: {type(e).__name__}: {e}")
-            return EvalResult(error=True, reasoning=f"Error: unusable OpenRouter response ({type(e).__name__})")
+            logger.warning(f"{provider} response not usable as a verdict: {type(e).__name__}: {e}")
+            return EvalResult(error=True, reasoning=f"Error: unusable {provider} response ({type(e).__name__})")
