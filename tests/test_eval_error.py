@@ -133,6 +133,29 @@ async def test_a_single_error_skips_only_that_candidate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mid_scrape_crash_sets_result_error(monkeypatch):
+    """A hard crash anywhere in the scrape (here: search explodes) must surface
+    in result.error, not just the logs. Before the fix the generic handler set
+    partial=True but left error='' — so the webhook read as a normal
+    "found nothing" run and n8n's aborted branch could never catch it."""
+    cards = [_Card("X")]
+    _wire_common(monkeypatch, cards)
+
+    async def exploding_search(*a, **k):
+        raise RuntimeError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    monkeypatch.setattr(main_mod, "search_candidates", exploding_search)
+
+    result = await main_mod.run_scrape(_job())
+
+    assert result.partial is True
+    assert result.error, "a crash must record why in the webhook payload"
+    assert result.error.startswith("Scrape crashed:")
+    assert "RuntimeError" in result.error
+    assert "ERR_TUNNEL_CONNECTION_FAILED" in result.error
+
+
+@pytest.mark.asyncio
 async def test_genuine_no_match_verdict_is_unchanged(monkeypatch):
     """Control: an error=False match=False verdict is emitted exactly as before,
     proving the fix only diverts *errors*, not verdicts."""

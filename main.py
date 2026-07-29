@@ -776,6 +776,12 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         logger.error(f"Scrape error: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
         result.partial = True
+        # A crash is an abort, not a "found nothing": it must reach the webhook
+        # payload, where n8n's aborted branch can see it. current_status is only
+        # visible on /status, which nothing polls. Keep an earlier, more precise
+        # abort reason (e.g. the eval-error threshold) if one was already set.
+        if not result.error:
+            result.error = f"Scrape crashed: {type(e).__name__}: {e}"
         current_status["error"] = str(e)
     finally:
         if browser:
