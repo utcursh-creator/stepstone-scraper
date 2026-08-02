@@ -28,7 +28,8 @@ import logging
 import re
 from urllib.parse import urlparse, parse_qs
 
-from patchright.async_api import Page
+from patchright.async_api import ElementHandle, Page
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from utils.delays import human_delay
 from utils.geocode import strip_ortsteil
@@ -42,6 +43,41 @@ DIRECTSEARCH_URL = "https://www.stepstone.de/5/index.cfm?event=directsearchgen4:
 RADIUS_KM_OPTIONS = (0, 5, 10, 25, 50, 75, 100)
 RADIUS_KM_TO_INDEX = {km: idx for idx, km in enumerate(RADIUS_KM_OPTIONS)}
 DEFAULT_RADIUS_KM = 25  # StepStone's own default — no hijack needed for this
+
+# The one input every criterion is typed into. DirectSearch is an Angular SPA,
+# so this element is rendered by JS AFTER the HTML shell parses — it is never
+# present at `domcontentloaded`.
+SEARCH_FIELD_SELECTOR = "#searchfield__textfield"
+
+# How long to wait for the field after a NAVIGATION (cold Angular bootstrap:
+# bundle fetch + compile + first digest, through a German residential proxy).
+#
+# Why this exists (prod 2026-07-31, offer 2468458 'Physiotherapeut (m/w/d)' in
+# Warendorf): the code used to probe for the field ONCE with query_selector,
+# which never waits, and raised on a miss. The job aborted 5.43s after the
+# search started — and the two human_delay calls above the probe account for
+# 3.0-5.5s of that, so the Angular app had been given a fixed nap, not a
+# condition. The run had just completed a FRESH login (26.7s), so the app was
+# bootstrapping from cold on a brand-new proxy exit.
+#
+# Why 30s and not "whatever page.goto allows": page.goto(...,
+# wait_until="domcontentloaded", timeout=60000) measures a different thing —
+# it can return in ~1s with a parsed shell and zero Angular. That 60s bounds
+# the network; this bounds the bootstrap. It must stay bounded because nothing
+# above it is: run_scrape has no outer timeout and holds `scrape_lock` for the
+# whole job, so every second spent here is a second in which n8n's next
+# /scrape gets a 409. Worst case is 2 x 30s (search_candidates may call
+# _execute_search twice via the 0-results keyword fallback). On the healthy
+# path this costs ~0 — wait_for_selector returns immediately when the
+# condition already holds.
+SEARCH_FIELD_TIMEOUT_MS = 30_000
+
+# How long to wait for the field BETWEEN criteria. Deliberately shorter than
+# the cold-start budget: the page is already bootstrapped and we are only
+# absorbing an Angular re-render (committing a criterion re-runs the search,
+# which re-compiles the query box). A job can pay this 2 + len(keywords)
+# times, so it must not be a 30s-per-criterion stall.
+SEARCH_FIELD_SETTLE_TIMEOUT_MS = 10_000
 
 
 def _km_to_radius_index(km: int) -> int:
@@ -138,6 +174,120 @@ async def _kill_cookie_banner(page: Page) -> None:
         """)
     except Exception:
         pass
+
+
+async def _wait_for_search_field(page: Page, timeout_ms: int) -> ElementHandle | None:
+    """Await `SEARCH_FIELD_SELECTOR` and return its handle, or None on timeout.
+
+    `state="visible"` (not "attached") because every caller immediately clicks
+    and types into the handle: an element Angular has inserted but not yet
+    unhidden would pass an "attached" check and then fail the click.
+
+    Only patchright's TimeoutError is swallowed — a closed page or a destroyed
+    execution context still propagates.
+    """
+    try:
+        return await page.wait_for_selector(
+            SEARCH_FIELD_SELECTOR, state="visible", timeout=timeout_ms
+        )
+    except PlaywrightTimeoutError:
+        return None
+
+
+# The failure this diagnoses is invisible in the log otherwise: on 2026-07-31
+# the raise carried the selector name and nothing else, so "the SPA had not
+# bootstrapped yet", "we were redirected to the login page" and "Akamai served
+# a deny page" were indistinguishable after the fact. These probes are the
+# repo's own: the login selector is auth.py's session check, the consent
+# selectors are _kill_cookie_banner's, the recaptcha selector is auth.py's,
+# and `.miniprofile` is the card container.
+_PAGE_SNAPSHOT_JS = r"""() => {
+    const q = (sel) => document.querySelector(sel) !== null;
+    const clone = document.body ? document.body.cloneNode(true) : null;
+    if (clone) clone.querySelectorAll('.miniprofile').forEach(el => el.remove());
+    const text = clone ? (clone.innerText || '').replace(/\s+/g, ' ').trim() : '';
+    return {
+        ready_state: document.readyState,
+        // Angular stamps .ng-scope on every scope it compiles. Zero means the
+        // SPA never bootstrapped (bundle blocked/failed, JS error, or this is
+        // not the app at all) — a different fix from "bootstrapped but slow".
+        angular_scopes: document.querySelectorAll('.ng-scope').length,
+        // Attached-but-invisible is a different bug from absent.
+        field_attached: q('#searchfield__textfield'),
+        login_form: q("input[name='username'], input[name='password']"),
+        consent_wall: q("#onetrust-accept-btn-handler, #GDPRConsentManagerContainer, [id*='consent-overlay'], .cc-accordion"),
+        captcha: q("iframe[src*='recaptcha'], iframe[src*='hcaptcha'], #challenge-form"),
+        result_cards: document.querySelectorAll('.miniprofile').length,
+        body: text.slice(0, 300),
+    };
+}"""
+
+_SAFE_QUERY_KEYS = frozenset({"event"})
+_PII_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_PII_DIGITS_RE = re.compile(r"\d{5,}")
+
+
+def _redact(text: str) -> str:
+    """Mask anything PII-shaped in a page snippet before it is logged.
+
+    This string travels to the webhook and into the operator's alert mail, and
+    this repo is public — a stale results page's body text is nothing but
+    candidate data. 5+ digit runs cover StepStone IDs, postcodes and phone
+    numbers; shorter runs (status codes, years, "25km") are left readable
+    because they are the diagnostic content this snippet exists to carry.
+    """
+    return _PII_DIGITS_RE.sub("<num>", _PII_EMAIL_RE.sub("<email>", text or ""))
+
+
+def _safe_url(url: str) -> str:
+    """origin+path, with every non-whitelisted query VALUE redacted.
+
+    Dropping the query wholesale would throw away the single most useful fact
+    (`event=directsearchgen4:searchprofiles` — which StepStone view answered),
+    while session tokens must never be logged.
+    """
+    try:
+        parsed = urlparse(url or "")
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        rendered = "&".join(
+            f"{key}={(params[key] or [''])[0]}" if key in _SAFE_QUERY_KEYS
+            else f"{key}=<redacted>"
+            for key in sorted(params)
+        )
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        return f"{base}?{rendered}" if rendered else base
+    except Exception:
+        return "<unparseable>"
+
+
+async def _diagnose_search_field(page: Page) -> dict:
+    """Best-effort snapshot of what the page actually was. Never raises.
+
+    Each probe is guarded separately so a diagnostic can never replace the
+    error it describes.
+    """
+    facts: dict = {}
+    try:
+        facts["url"] = _safe_url(page.url)
+    except Exception:
+        facts["url"] = "<unavailable>"
+    try:
+        facts["title"] = await page.title()
+    except Exception:
+        facts["title"] = "<unavailable>"
+    try:
+        snapshot = await page.evaluate(_PAGE_SNAPSHOT_JS)
+        if isinstance(snapshot, dict):
+            snapshot["body"] = _redact(snapshot.get("body", ""))
+            facts.update(snapshot)
+    except Exception as e:
+        facts["snapshot_error"] = type(e).__name__
+    return facts
+
+
+def _format_diagnosis(facts: dict) -> str:
+    """Render `facts` as a single greppable line for the log AND the webhook."""
+    return " ".join(f"{key}={facts[key]!r}" for key in sorted(facts))
 
 
 def _extract_profile_id(href: str) -> str:
@@ -305,9 +455,17 @@ async def _add_criterion_via_autosuggest(page: Page, term: str) -> None:
     typing the next criterion without `field.fill('')` produces a concatenated
     keyword like "MünchenBauleiter".
     """
-    field = await page.query_selector("#searchfield__textfield")
+    # Short budget, not the cold-start one: the page is already bootstrapped
+    # here, but committing the PREVIOUS criterion re-runs the search, which
+    # re-compiles the query box and can briefly detach this input. That is a
+    # re-render to ride out, not a boot.
+    field = await _wait_for_search_field(page, SEARCH_FIELD_SETTLE_TIMEOUT_MS)
     if not field:
-        raise RuntimeError("DirectSearch field #searchfield__textfield not found")
+        raise RuntimeError(
+            f"SEARCH_FIELD_LOST: {SEARCH_FIELD_SELECTOR} did not come back within "
+            f"{SEARCH_FIELD_SETTLE_TIMEOUT_MS}ms before criterion {term!r}. "
+            f"{_format_diagnosis(await _diagnose_search_field(page))}"
+        )
 
     await field.click(force=True, timeout=10000)
     await field.fill("")  # see docstring — required between criteria
@@ -334,8 +492,19 @@ async def _add_keyword_criterion(page: Page, keyword: str) -> bool:
     being interpreted as a job-title or location criterion. Returns True if a
     keyword chip was added via the keyword section, False if it fell back.
     """
-    field = await page.query_selector("#searchfield__textfield")
+    field = await _wait_for_search_field(page, SEARCH_FIELD_SETTLE_TIMEOUT_MS)
     if not field:
+        # Deliberately NOT fatal: a lost keyword only WIDENS the search, and
+        # main.py's per-job unlock cap still bounds the credit spend. But the
+        # old `return False` was silent AND the caller discards the return
+        # value, so a broader (more expensive) search was indistinguishable
+        # from a normal one in the log. Say it out loud.
+        logger.warning(
+            f"SEARCH_FIELD_LOST: dropping keyword {keyword!r} — "
+            f"{SEARCH_FIELD_SELECTOR} not visible within "
+            f"{SEARCH_FIELD_SETTLE_TIMEOUT_MS}ms. This search is BROADER than "
+            f"requested. {_format_diagnosis(await _diagnose_search_field(page))}"
+        )
         return False
     await field.click(force=True)
     await field.fill("")
@@ -495,9 +664,18 @@ async def _execute_search(
     await _kill_cookie_banner(page)
     await human_delay(1000, 2000)
 
-    field = await page.query_selector("#searchfield__textfield")
+    # WAIT for the field — do not probe for it once. `domcontentloaded` fires
+    # when the HTML shell is parsed, which on this Angular SPA is before the
+    # field exists, and the two human_delays above are a fixed nap that the
+    # bootstrap can outlast (prod 2026-07-31: aborted the whole batch 5.43s in).
+    field = await _wait_for_search_field(page, SEARCH_FIELD_TIMEOUT_MS)
     if not field:
-        raise RuntimeError("DirectSearch field #searchfield__textfield not found")
+        facts = await _diagnose_search_field(page)
+        raise RuntimeError(
+            f"SEARCH_FIELD_TIMEOUT: DirectSearch field {SEARCH_FIELD_SELECTOR} never "
+            f"became visible after navigation ({SEARCH_FIELD_TIMEOUT_MS}ms). "
+            f"{_format_diagnosis(facts)}"
+        )
 
     # 2. Add structured job_title criterion (drops "(m/w/d)" gender markers)
     clean_title = _strip_gender_marker(job_title)

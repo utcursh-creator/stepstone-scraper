@@ -213,6 +213,11 @@ class _FakePage:
     async def query_selector(self, *a, **k):
         return _FakeField()
 
+    # _execute_search AWAITS the Angular-rendered search field rather than
+    # probing for it once (prod 2026-07-31 — see tests/test_search_field_wait.py).
+    async def wait_for_selector(self, *a, **k):
+        return _FakeField()
+
     async def evaluate(self, *a, **k):
         return None
 

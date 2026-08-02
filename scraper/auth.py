@@ -1,11 +1,20 @@
 import json
+import logging
 import os
 import re
 from patchright.async_api import BrowserContext, Page
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 from utils.delays import human_delay
+
+logger = logging.getLogger(__name__)
 
 LOGIN_URL = "https://www.stepstone.de/5/recruiterspace/login"
 DIRECTSEARCH_URL = "https://www.stepstone.de/5/index.cfm?event=directsearchgen4:searchprofiles"
+
+# The DirectSearch search input — present only for an authenticated recruiter.
+# Used as the POSITIVE proof that a restored session still works.
+AUTHENTICATED_MARKER = "#searchfield__textfield"
+AUTHENTICATED_MARKER_TIMEOUT_MS = 20_000
 
 
 class AuthenticationError(Exception):
@@ -96,11 +105,31 @@ async def authenticate(
     if saved_cookies:
         await context.add_cookies(saved_cookies)
         await page.goto(DIRECTSEARCH_URL, wait_until="domcontentloaded")
-        await human_delay(1000, 2000)
-        # Session valid if no login form is present (URL may contain 'login' as substring)
-        has_login_form = await page.query_selector("input[name='username'], input[name='password']") is not None
-        if not has_login_form:
+        # Assert a POSITIVE marker of the authenticated app, not the ABSENCE of
+        # a login form. The old absence test failed OPEN: given 1-2s on an
+        # Angular SPA it passes simply because nothing has rendered yet, and a
+        # bot-challenge or maintenance page contains no login form either — so
+        # authenticate() returned, main.py logged "Authentication successful",
+        # and the search phase then crashed on a page that was never the app.
+        # These cookies make that a live risk: StepStone's recruiter auth
+        # cookies (PHRECRUITERAUTHCOOKIE, RSTOKEN, authHash, X-AUTH-CSRF-TOKEN)
+        # are all browser-session scoped (expires=-1), yet the jar is persisted
+        # and replayed for as long as the container lives.
+        try:
+            await page.wait_for_selector(
+                AUTHENTICATED_MARKER,
+                state="visible",
+                timeout=AUTHENTICATED_MARKER_TIMEOUT_MS,
+            )
+            logger.info(f"Reused saved StepStone session for {email}")
             return  # Session still valid
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"Saved session for {email} did not reach DirectSearch within "
+                f"{AUTHENTICATED_MARKER_TIMEOUT_MS}ms. Falling through to a "
+                f"fresh login. A fresh login costs no StepStone credits — only "
+                f"a stale session does, by aborting the job later."
+            )
 
     # 2. Fresh login
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
