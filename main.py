@@ -518,20 +518,26 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
 
             # 4d. Unlock + extract profile (THIS CLICK SPENDS ONE CREDIT)
             logger.info(f"Match! Extracting profile {candidate.profile_id}")
-            profile = await extract_profile(
+            profile, credit_spent = await extract_profile(
                 page,
                 candidate.profile_id,
                 account_label,
                 preview_cv_url=getattr(candidate, "cv_url", ""),
             )
-            if profile:
-                # Unlock succeeded — record the credit spend immediately, before
-                # any post-unlock gate can `continue` past this point.
+            # Charge the budget for every credit StepStone actually took, NOT
+            # only the ones we got data back from. These are different events:
+            # the click spends the credit, and the dialog can still fail to
+            # render or populate afterwards. Recording only on success let the
+            # counter drift BELOW real spend, so the daily cap then authorised
+            # extra unlocks on top of credits already burned.
+            if credit_spent:
                 _new_unlock_count = unlock_budget.record_unlock(UNLOCK_COUNTER_PATH, today)
                 logger.info(
                     f"Unlock recorded: {_new_unlock_count}/{settings.max_unlocks_per_day} "
-                    f"today ({candidate.profile_id})"
+                    f"today ({candidate.profile_id}"
+                    f"{'' if profile else ', EXTRACTION FAILED — credit spent for nothing'})"
                 )
+            if profile:
                 # ============================================================
                 # POST-UNLOCK GATE 0: Global Recruitee dedup (runs FIRST)
                 # Skip if email exists ANYWHERE in Recruitee (any offer, any

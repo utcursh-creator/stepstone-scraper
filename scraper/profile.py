@@ -5,14 +5,39 @@ Based on live probing 2026-04-17:
 - Dialog inner text contains labeled fields: Email, Mobil, Wohnadresse, StepStone ID, CV
 - Each profile unlock consumes one credit from the recruiter account
 """
+import asyncio
 import base64
 import logging
 import re
+import time
 from patchright.async_api import Page
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 from models.candidate import CandidateResult
 from utils.delays import human_delay
 
 logger = logging.getLogger(__name__)
+
+# The unlock modal. Angular inserts this element and only THEN fills it from the
+# unlock response, so its presence and its content are two separate waits.
+DIALOG_SELECTOR = "div.ngdialog:last-of-type"
+
+# How long to wait for the dialog to appear AFTER the click that spends the
+# credit. Deliberately generous: by the time we are waiting here the credit is
+# already gone, so giving up early converts a slow render into a paid-for
+# nothing. The old code waited a blind human_delay(3000, 4500) and then probed
+# once with a non-waiting query_selector — a TIGHTER budget than the 3.0-5.5s
+# nap that demonstrably lost the race in DirectSearch on 2026-07-31.
+DIALOG_TIMEOUT_MS = 30_000
+
+# How long to wait for the unlock RESPONSE to populate the dialog. The shell can
+# be visible with empty fields; reading then makes every regex miss and the
+# candidate is emitted with unlocked=True and no email/phone — a paid-for
+# contact record with no contact details, which also bypasses the Recruitee
+# dedup in main.py (it is gated on `profile.email or profile.phone`).
+DIALOG_CONTENT_TIMEOUT_MS = 15_000
+
+# How often to re-read the dialog while waiting for it to populate.
+DIALOG_POLL_INTERVAL_S = 0.5
 
 
 # Regex patterns for extracting structured fields from dialog text
@@ -24,23 +49,70 @@ RE_STEPSTONE_ID = re.compile(r"StepStone ID\s+(\d+)", re.IGNORECASE)
 RE_NAME_HEADER = re.compile(r"^\s*([^\n]+?)\s*\n", re.MULTILINE)
 
 
-async def _click_candidate(page: Page, profile_id: str) -> bool:
-    """Click the miniprofile name link to unlock + open dialog."""
+async def _click_candidate(page: Page, profile_id: str) -> tuple[bool, bool]:
+    """Click the miniprofile name link to unlock + open the dialog.
+
+    Returns `(dialog_open, credit_spent)`.
+
+    The two flags are separate because the caller must be able to tell "we never
+    clicked, so this cost nothing" from "we clicked, the credit is gone, and the
+    dialog never rendered". Collapsing them into one bool (the old behaviour) is
+    what let a spent credit go unrecorded: main.py only called record_unlock
+    inside `if profile:`, so a dialog that failed to render left the daily
+    counter BELOW real spend — the cap then permitted extra unlocks on top.
+    """
     # Find the card whose profile link contains this profile ID
     link = await page.query_selector(f"a.miniprofile__name[href*='profileID={profile_id}']")
     if not link:
         # Fallback: any link with this profile ID
         link = await page.query_selector(f"a[href*='profileID={profile_id}']")
     if not link:
-        return False
+        return False, False
     try:
         await link.click(force=True, timeout=10000)
-    except Exception:
-        return False
-    await human_delay(3000, 4500)
-    # Check dialog opened
-    dialog = await page.query_selector("div.ngdialog:last-of-type")
-    return dialog is not None
+    except Exception as e:
+        # The click never landed, so StepStone never charged us.
+        logger.warning(f"  Unlock click failed for {profile_id} (no credit spent): {e}")
+        return False, False
+
+    # PAST THIS POINT THE CREDIT IS SPENT. Wait for the dialog on a condition,
+    # never on a nap.
+    try:
+        await page.wait_for_selector(
+            DIALOG_SELECTOR, state="visible", timeout=DIALOG_TIMEOUT_MS
+        )
+        return True, True
+    except PlaywrightTimeoutError:
+        logger.error(
+            f"  UNLOCK DIALOG TIMEOUT for {profile_id}: the click spent a credit but "
+            f"{DIALOG_SELECTOR} never became visible within {DIALOG_TIMEOUT_MS}ms. "
+            f"The credit is gone and the profile data was not obtained."
+        )
+        return False, True
+
+
+async def _wait_for_dialog_content(dialog, timeout_ms: int) -> str:
+    """Poll the dialog's text until the unlock response has populated it.
+
+    `StepStone ID <digits>` is the readiness sentinel: it is present on every
+    unlocked profile, unlike email/phone which some candidates genuinely lack,
+    so it cannot be confused with a real candidate having no contact details.
+
+    Returns whatever text we ended up with — the caller decides whether it is
+    usable, so a wrong sentinel can never turn every unlock into a total loss.
+    """
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    text = ""
+    while True:
+        try:
+            text = await dialog.inner_text()
+        except Exception:
+            text = ""
+        if text and RE_STEPSTONE_ID.search(text):
+            return text
+        if time.monotonic() >= deadline:
+            return text
+        await asyncio.sleep(DIALOG_POLL_INTERVAL_S)
 
 
 async def _extract_name(dialog_text: str) -> str:
@@ -167,17 +239,40 @@ async def extract_profile(
     Args:
         preview_cv_url: CV URL from the search card (if available, avoids re-finding in dialog)
 
-    Returns CandidateResult with unlocked=True if successful, None on click failure.
+    Returns `(result, credit_spent)`. `result` is None when the profile could
+    not be extracted; `credit_spent` is True whenever the unlock click landed,
+    INDEPENDENT of whether extraction succeeded, so the caller can charge the
+    daily budget for every credit StepStone actually took.
     """
-    if not await _click_candidate(page, profile_id):
-        return None
+    dialog_open, credit_spent = await _click_candidate(page, profile_id)
+    if not dialog_open:
+        return None, credit_spent
 
-    dialog = await page.query_selector("div.ngdialog:last-of-type")
+    dialog = await page.query_selector(DIALOG_SELECTOR)
     if not dialog:
-        return None
+        return None, credit_spent
 
     try:
-        dialog_text = await dialog.inner_text()
+        # The shell can be visible with empty fields — wait for the unlock
+        # response to land before reading, or every regex below silently misses
+        # and we emit a paid-for candidate with no contact details.
+        dialog_text = await _wait_for_dialog_content(dialog, DIALOG_CONTENT_TIMEOUT_MS)
+        if not RE_STEPSTONE_ID.search(dialog_text):
+            # Sentinel never appeared. Accept the text anyway IF it clearly holds
+            # real data — a wrong sentinel must never turn every unlock into a
+            # total loss — otherwise treat it as an extraction failure.
+            if not (RE_EMAIL.search(dialog_text) or RE_MOBIL.search(dialog_text)
+                    or RE_PHONE_HOME.search(dialog_text)):
+                logger.error(
+                    f"  UNLOCK CONTENT TIMEOUT for {profile_id}: dialog rendered but "
+                    f"never populated within {DIALOG_CONTENT_TIMEOUT_MS}ms "
+                    f"({len(dialog_text)} chars). Credit spent, no data extracted."
+                )
+                return None, credit_spent
+            logger.warning(
+                f"  {profile_id}: 'StepStone ID' sentinel absent but contact fields "
+                f"are present — proceeding on the contact fields."
+            )
 
         # Name from first line of dialog text
         name = await _extract_name(dialog_text)
@@ -231,6 +326,6 @@ async def extract_profile(
             cv_base64=cv_base64,
             cv_filename=cv_filename,
             account_used=account_used,
-        )
+        ), credit_spent
     finally:
         await _close_dialog(page)
