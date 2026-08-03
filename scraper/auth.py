@@ -132,6 +132,22 @@ async def authenticate(
             )
 
     # 2. Fresh login
+    #
+    # Discard every cookie FIRST. Two ways this bites otherwise, and both end
+    # as "All accounts failed to authenticate" (prod 2026-08-03):
+    #   a) We just decided the restored session is unusable, but its cookies are
+    #      still in the context. If that session was in fact valid and merely
+    #      slow, StepStone redirects an authenticated browser AWAY from the
+    #      login page — so no username field renders and the "could not find
+    #      username input" raise below misreads being logged in as a failure.
+    #   b) main.py's fallback loop retries the OTHER account on this SAME
+    #      context, so account 1's cookies would be replayed while trying to log
+    #      in as account 2, and the second attempt fails for the first
+    #      account's reasons.
+    # A fresh login costs no StepStone credits, so discarding a possibly-good
+    # session is always cheaper than misreading one.
+    await context.clear_cookies()
+
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
     await human_delay(2000, 4000)
     await _dismiss_cookie_banner(page)
