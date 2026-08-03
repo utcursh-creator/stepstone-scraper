@@ -1,0 +1,44 @@
+PROPRIETARY SOFTWARE — ALL RIGHTS RESERVED
+
+Copyright (c) 2026 Apex Consulting. All rights reserved.
+
+This software is proprietary and confidential. It is NOT open source, and no
+open-source licence is granted by its presence in a public or private code
+repository. Public visibility of this repository does not place the software
+in the public domain and does not grant any licence to copy, use, modify or
+distribute it.
+
+GRANT
+
+Apex Consulting grants Aramaz Digital a non-exclusive, non-transferable,
+royalty-free licence to host, run, modify and maintain this software for its
+own internal recruiting operations, including deploying it to infrastructure
+Aramaz Digital controls, for the duration of the parties' agreement.
+
+This grant does not include the right to sublicense, resell, or distribute the
+software to third parties, or to offer it as a service to others.
+
+NO WARRANTY
+
+The software is provided "as is", without warranty of any kind, express or
+implied. This software automates interactions with third-party services
+(StepStone, Recruitee, Airtable, n8n and an LLM provider) and spends paid
+credits on the operator's accounts. The operator is responsible for its
+configuration, for the credentials it is given, and for the spend it incurs.
+
+THIRD-PARTY TERMS
+
+Operating this software requires accounts with third-party services and is
+subject to their terms. In particular, automated access to StepStone must be
+covered by the operator's own agreement with StepStone. Nothing in this licence
+grants any right in respect of those services.
+
+CONTACT
+
+Apex Consulting — utkarsh@apex-consulting.ai
+
+---
+NOTE FOR THE PARTIES: this file records the intended commercial position in
+plain language. It is not legal advice and has not been reviewed by counsel.
+Confirm the party names, the scope of the grant, and its duration against the
+signed agreement before relying on it.

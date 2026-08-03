@@ -1,10 +1,30 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-patchright>=1.58.0
-httpx>=0.28.0
-python-dotenv>=1.0.1
-pydantic>=2.10.0
-pydantic-settings>=2.5.0
-python-multipart>=0.0.9
-2captcha-python>=1.0.3
-geopy
+# PINNED ON PURPOSE — do not relax these back to `>=`.
+#
+# These were all `>=` lower bounds (geopy had no constraint at all), so pip
+# resolved "newest available" at BUILD time. Two consequences:
+#   1. Each Railway redeploy could install different library versions than the
+#      one before it — so identical source was not an identical runtime.
+#   2. A second deployment built from this repo (the client's own Railway
+#      instance) resolved a DIFFERENT dependency set than the agency's. That is
+#      the classic "works on ours, not on theirs" bug, and the hardest kind to
+#      diagnose precisely because the source is byte-identical.
+#
+# These are the versions the test suite (251 tests) passes against.
+#
+# patchright must stay compatible with the Docker base image
+# `mcr.microsoft.com/playwright/python:v1.58.0-jammy` (see Dockerfile). If you
+# bump one, bump the other in the same commit — a patchright/browser mismatch
+# fails at runtime inside the container, not at build time.
+#
+# To upgrade deliberately: change a pin, run `pytest tests/`, and deploy while
+# the scraper is IDLE (a redeploy kills any in-flight scrape).
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+patchright==1.58.2
+httpx==0.28.1
+python-dotenv==1.2.2
+pydantic==2.13.3
+pydantic-settings==2.14.0
+python-multipart==0.0.27
+2captcha-python==2.0.6
+geopy==2.4.1
