@@ -1,0 +1,29 @@
+# Keep secrets and runtime state OUT of the image.
+#
+# The Dockerfile ends with `COPY . .`, so without this file anything sitting in
+# a developer's working tree is baked into an image layer — including
+# sessions/*.json, which holds live StepStone recruiter auth cookies
+# (PHRECRUITERAUTHCOOKIE, RSTOKEN, authHash, X-AUTH-CSRF-TOKEN). Those are
+# gitignored, so they never reach the repo, but `docker build` does not read
+# .gitignore. Anyone who builds locally and pushes the image ships them.
+.env
+.env.*
+!.env.example
+sessions/
+state/
+screenshots/
+stepstone_cookies.json
+
+# Not secret, just dead weight in a multi-GB Playwright image.
+.git
+.gitignore
+.github/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.vscode/
+docs/
+tests/
+*.png

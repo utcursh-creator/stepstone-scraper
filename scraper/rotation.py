@@ -34,7 +34,7 @@ def resolve_requested_account(accounts: list[dict], requested: str | None) -> di
     """Resolve an n8n-supplied `account` value to one of our configured accounts.
 
     Accepts any of:
-      - email           e.g. "jn@aramaz-digital.de"
+      - email           e.g. "recruiter@example.com"
       - "Account 1" / "Account 2" (case-insensitive, with or without space)
       - "1" / "2"       1-based index
 
