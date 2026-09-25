@@ -133,3 +133,52 @@ async def test_the_live_search_summary_holds_counts_and_never_candidate_data(sit
     assert [r["page_number"] for r in fake.search_requests] == [0], "first page only"
     text = json.dumps(summary)
     assert "Test" not in text and "00000000-" not in text and "22589" not in text, "counts only"
+
+
+async def _logged_in_search(site, monkeypatch):  # noqa: F811
+    from scraper import talent_search
+    from scraper.talent_search import search_talents
+
+    async def instant(*a, **k):
+        return None
+    monkeypatch.setattr(talent_search, "human_delay", instant)
+    fake, context, page, _ = site
+    ok, _ = await check_login.run_check(context, page, EMAIL, PASSWORD)
+    assert ok
+    return fake, page, await search_talents(page, "Physiotherapeut", "Hamburg", max_pages=1)
+
+
+async def test_unlock_one_spends_exactly_one_credit_and_reports_no_contact_data(site, monkeypatch):  # noqa: F811
+    import utils.geocode
+    monkeypatch.setattr(utils.geocode, "calculate_distance_km", lambda a, b: 12.0)
+    fake, page, outcome = await _logged_in_search(site, monkeypatch)
+
+    report = await check_login.unlock_one(page, outcome, "Hamburg", 25)
+
+    assert len(fake.unlock_requests) == 1, "exactly one unlock"
+    assert fake.unlock_requests[0]["uniqueSearchCriteriaId"] == 68799
+    assert report["unlocked"] and report["credit_spent"]
+    assert (report["balance_before"], report["balance_after"]) == (147, 146)
+    assert report["email_present"] and report["phone_present"] and report["home_address_present"]
+    assert report["cv"].startswith("pdf, ")
+    text = json.dumps(report)
+    for private in ("Test", "Person", "example.test", "170", "22589", "00000000-"):
+        assert private not in text, f"contact data leaked into the report: {private}"
+
+
+async def test_unlock_one_spends_nothing_when_no_candidate_is_close_enough(site, monkeypatch):  # noqa: F811
+    import utils.geocode
+    monkeypatch.setattr(utils.geocode, "calculate_distance_km", lambda a, b: 80.0)
+    fake, page, outcome = await _logged_in_search(site, monkeypatch)
+
+    report = await check_login.unlock_one(page, outcome, "Hamburg", 25)
+
+    assert fake.unlock_requests == [] and report["unlocked"] is False
+    assert "nothing spent" in report["reason"]
+
+
+async def test_unlock_one_without_search_is_refused_before_any_browser(monkeypatch, capsys):
+    monkeypatch.setenv("STEPSTONE_EMAIL_1", EMAIL)
+    monkeypatch.setenv("STEPSTONE_PASS_1", PASSWORD)
+    assert await check_login.main(["--unlock-one", "--no-proxy"]) == 2
+    assert "--unlock-one needs --search" in capsys.readouterr().err

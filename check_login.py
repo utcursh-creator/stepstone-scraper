@@ -16,6 +16,9 @@ Options:  --inspect     after logging in, open Talent Finder and report (structu
           --search "Physiotherapeut" --location Hamburg [--distance 25]
                         after logging in, run ONE real Talent Finder search
                         (first page only, nothing unlocked) and print counts
+          --unlock-one  with --search: unlock ONE candidate from that first page
+                        (locked, with a CV, inside --distance). SPENDS 1 CREDIT.
+                        Prints yes/no and counts only, never contact details
           --fresh       forget the saved session and log in from scratch
           --account 2   check the second account
           --no-proxy    log in without the proxy (to tell a proxy problem apart)
@@ -192,6 +195,47 @@ def search_summary(outcome) -> dict:
     }
 
 
+async def unlock_one(page, outcome, job_location: str, max_km: int) -> dict:
+    """Unlock ONE candidate the way a job would: this spends a StepStone credit.
+    The first locked candidate on the page with a CV whose home is within
+    max_km, so the credit buys someone Aramaz could actually use. Yes/no and
+    counts only: no name, email, phone, address or id leaves this function."""
+    from scraper.talent_unlock import UnlockError, _balance, unlock_talent
+    from utils.geocode import calculate_distance_km
+
+    pick = None
+    for r in outcome.first_page:
+        if not (r.is_locked and r.has_cv_attachment and r.postal_code):
+            continue
+        km = calculate_distance_km(r.wohnort, job_location)
+        if km is not None and km <= max_km:
+            pick = r
+            break
+    if pick is None:
+        return {"unlocked": False,
+                "reason": f"no locked candidate with a CV within {max_km} km on the first page; nothing spent"}
+    before = await _balance(page)
+    try:
+        result, credit_spent = await unlock_talent(page, pick, "check_login", outcome.criteria_id)
+    except UnlockError as e:
+        return {"unlocked": False, "reason": f"[{e.code}] {e}", "balance_before": before}
+    after = await _balance(page)
+    summary = {"unlocked": result is not None, "credit_spent": credit_spent,
+               "balance_before": before, "balance_after": after}
+    if result is not None:
+        summary.update({
+            "unlock_reason": result.unlock_reason,
+            "name_present": bool(result.name),
+            "email_present": bool(result.email),
+            "phone_present": bool(result.phone),
+            "home_address_present": result.profile_text.startswith("Wohnadresse "),
+            "cv": (f"{result.cv_filename.rsplit('.', 1)[-1]}, {len(result.cv_base64) * 3 // 4 // 1024} KB"
+                   if result.cv_base64 else "none"),
+            "llm_text_chars": len(result.profile_text),
+        })
+    return summary
+
+
 def _parse(argv):
     p = argparse.ArgumentParser(description="Check the Stepstone Recruit login (no credits spent).")
     p.add_argument("--account", type=int, choices=(1, 2), default=1)
@@ -199,6 +243,8 @@ def _parse(argv):
     p.add_argument("--search", default="", help="job title for one live search (first page only)")
     p.add_argument("--location", default="", help="location for --search")
     p.add_argument("--distance", type=int, default=25, help="max distance in km for --search")
+    p.add_argument("--unlock-one", action="store_true",
+                   help="with --search: unlock ONE candidate (spends 1 credit)")
     p.add_argument("--fresh", action="store_true", help="forget the saved session and log in from scratch")
     p.add_argument("--force", action="store_true",
                    help="ignore the limit of 2 fresh logins per hour (risks an account lock)")
@@ -218,6 +264,9 @@ async def main(argv=None) -> int:
         return 2
     if args.search and not args.location:
         print("--search needs --location.", file=sys.stderr)
+        return 2
+    if args.unlock_one and not args.search:
+        print("--unlock-one needs --search and --location.", file=sys.stderr)
         return 2
     if not args.no_proxy:
         missing = [v for v in ("PROXY_HOST", "PROXY_PORT", "PROXY_USER", "PROXY_PASS") if not _env(v)]
@@ -291,6 +340,11 @@ async def main(argv=None) -> int:
                 outcome = await search_talents(page, args.search, args.location,
                                                max_distance_km=args.distance, max_pages=1)
                 print(json.dumps(search_summary(outcome), indent=1, ensure_ascii=False))
+                if args.unlock_one:
+                    print(f"Unlocking ONE candidate within {args.distance} km (spends 1 credit)...")
+                    report = await unlock_one(page, outcome, args.location, args.distance)
+                    print(json.dumps(report, indent=1, ensure_ascii=False))
+                    ok = ok and report.get("unlocked", False)
             except SearchError as e:
                 print(f"SEARCH FAILED [{e.code}] {e}")
                 ok = False

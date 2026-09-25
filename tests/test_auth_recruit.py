@@ -156,6 +156,8 @@ class FakeStepstone:
         self.login_blank_loads = 0      # this many login page loads never show the form
         self.search_requests = []
         self.search_total = 27
+        self.remaining = CREDITS["remainingCredits"]
+        self.unlock_requests = []
 
     async def handle(self, route):
         req = route.request
@@ -187,6 +189,20 @@ class FakeStepstone:
                 return await route.fulfill(status=200, content_type="application/json", body=json.dumps(
                     {"content": content, "totalElements": total, "totalPages": -(-total // size),
                      "number": n, "size": size, "uniqueSearchCriteriaId": 68799}))
+            if path.startswith("/recruiter/talent-sourcing/api/v1/talent/unlock"):
+                headers = await req.all_headers()
+                if "tf_session=session-for-" not in headers.get("cookie", ""):
+                    return await route.fulfill(status=401, content_type="application/json", body="{}")
+                self.unlock_requests.append(req.post_data_json)
+                self.remaining -= 1
+                return await route.fulfill(status=200, content_type="application/json", body=json.dumps(
+                    {"alreadyUnlocked": False, "personalInfo": {
+                        "firstName": "Test", "lastName": "Person", "email": "t.person@example.test",
+                        "mobilePhoneNumber": "+49 170 0000000",
+                        "address": {"postalCode": "22589", "city": "Hamburg", "country": "DE"}}}))
+            if "/cv/view" in path:
+                return await route.fulfill(status=200, content_type="application/pdf",
+                                           body=b"%PDF-1.4\n" + b"0" * 4096 + b"\n%%EOF")
             if path.startswith("/recruiter/talent-sourcing/api/v1/credits"):
                 headers = await req.all_headers()
                 cookie = headers.get("cookie", "")
@@ -195,7 +211,8 @@ class FakeStepstone:
                 ok = "tf_session=session-for-" in cookie and (by_app or self.credits_mode == "cookie")
                 self.credits_calls.append((by_app, 200 if ok else 401))
                 if ok:
-                    return await route.fulfill(status=200, content_type="application/json", body=json.dumps(CREDITS))
+                    return await route.fulfill(status=200, content_type="application/json",
+                                               body=json.dumps({**CREDITS, "remainingCredits": self.remaining}))
                 return await route.fulfill(status=401, content_type="application/json", body="{}")
             return await route.fulfill(status=200, content_type="text/html",
                                        body=APP_HTML.replace("__LOGIN_TARGET__", self.login_target)
