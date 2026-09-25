@@ -30,3 +30,14 @@ async def test_missing_credentials_exit_2_without_opening_a_browser(monkeypatch,
     monkeypatch.delenv("STEPSTONE_PASS_2", raising=False)
     assert await check_login.main(["--account", "2"]) == 2
     assert "STEPSTONE_EMAIL_2" in capsys.readouterr().err
+
+
+def test_variables_are_found_in_either_case_like_the_scraper_reads_them(monkeypatch):
+    """Railway stores several of this service's variables in lowercase. The
+    scraper (pydantic-settings) reads them case-insensitively; so must the check."""
+    monkeypatch.delenv("STEPSTONE_EMAIL_1", raising=False)
+    monkeypatch.setenv("stepstone_email_1", "lower@example.test")
+    monkeypatch.setenv("PROXY_HOST", "proxy.test")
+    assert check_login._env("STEPSTONE_EMAIL_1") == "lower@example.test"
+    assert check_login._env("proxy_host") == "proxy.test"
+    assert check_login._env("NOT_SET_ANYWHERE", "fallback") == "fallback"

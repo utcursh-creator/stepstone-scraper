@@ -26,6 +26,20 @@ import time
 from dotenv import load_dotenv
 
 
+def _env(name: str, default: str = "") -> str:
+    """Read a variable the way the scraper's settings do: case-insensitively.
+    Railway holds several of this service's variables in lowercase
+    (stepstone_email_1, proxy_host, ...); pydantic-settings accepts either, so
+    this check must too, or it reports 'not set' for a perfectly good config."""
+    if name in os.environ:
+        return os.environ[name].strip()
+    wanted = name.lower()
+    for key, value in os.environ.items():
+        if key.lower() == wanted:
+            return value.strip()
+    return default
+
+
 async def run_check(context, page, email: str, password: str) -> tuple[bool, str]:
     """Log in once and describe the outcome in one line. Never includes the password."""
     from scraper import auth
@@ -49,13 +63,13 @@ async def main(argv=None) -> int:
     load_dotenv()  # never overrides variables already set (e.g. by `railway run`)
     args = _parse(argv)
     n = args.account
-    email = os.environ.get(f"STEPSTONE_EMAIL_{n}", "").strip()
-    password = os.environ.get(f"STEPSTONE_PASS_{n}", "").strip()
+    email = _env(f"STEPSTONE_EMAIL_{n}")
+    password = _env(f"STEPSTONE_PASS_{n}")
     if not email or not password:
         print(f"STEPSTONE_EMAIL_{n} and STEPSTONE_PASS_{n} must both be set.", file=sys.stderr)
         return 2
     if not args.no_proxy:
-        missing = [v for v in ("PROXY_HOST", "PROXY_PORT", "PROXY_USER", "PROXY_PASS") if not os.environ.get(v)]
+        missing = [v for v in ("PROXY_HOST", "PROXY_PORT", "PROXY_USER", "PROXY_PASS") if not _env(v)]
         if missing:
             print(f"Missing proxy variables: {', '.join(missing)} (or pass --no-proxy).", file=sys.stderr)
             return 2
@@ -79,11 +93,11 @@ async def main(argv=None) -> int:
     else:
         pw = None
         browser, context, page = await create_browser(
-            proxy_host=os.environ["PROXY_HOST"],
-            proxy_port=int(os.environ["PROXY_PORT"]),
-            proxy_user=os.environ["PROXY_USER"],
-            proxy_pass=os.environ["PROXY_PASS"],
-            proxy_country=os.environ.get("PROXY_COUNTRY", "DE"),
+            proxy_host=_env("PROXY_HOST"),
+            proxy_port=int(_env("PROXY_PORT")),
+            proxy_user=_env("PROXY_USER"),
+            proxy_pass=_env("PROXY_PASS"),
+            proxy_country=_env("PROXY_COUNTRY", "DE"),
         )
 
     # Show every step on the REAL site: the login module's own log lines (cookie
