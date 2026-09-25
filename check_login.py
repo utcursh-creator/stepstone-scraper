@@ -12,6 +12,9 @@ matters.
 Options:  --inspect     after logging in, open Talent Finder and report (structure
                         only, no search, no unlock) how the app calls its API
                         and how the search form is built; saves a JSON file
+          --search "Physiotherapeut" --location Hamburg [--distance 25]
+                        after logging in, run ONE real Talent Finder search
+                        (first page only, nothing unlocked) and print counts
           --account 2   check the second account
           --no-proxy    log in without the proxy (to tell a proxy problem apart)
           --headed      show the browser window
@@ -164,10 +167,36 @@ def _record_attempt(now: float) -> None:
         json.dump(attempts, f)
 
 
+def search_summary(outcome) -> dict:
+    """Counts only. No names, no ids, no candidate text leave this function."""
+    rs = outcome.first_page
+    n = len(rs) or 1
+    return {
+        "stepstone_total": outcome.total,
+        "pages_available": outcome.total_pages,
+        "keyword_sent": outcome.keyword,
+        "location_sent": outcome.location_name,
+        "radius_sent_km": outcome.radius_km or "Optimiert",
+        "keyword_fallback_used": outcome.keyword_fallback,
+        "first_page_results": len(rs),
+        "with_postcode": sum(1 for r in rs if r.postal_code),
+        "with_cv": sum(1 for r in rs if r.has_cv_attachment),
+        "still_locked": sum(1 for r in rs if r.is_locked),
+        "already_unlocked": sum(1 for r in rs if not r.is_locked),
+        "with_languages": sum(1 for r in rs if r.languages),
+        "with_desired_locations": sum(1 for r in rs if r.gewuenschte_arbeitsorte),
+        "avg_llm_text_chars": round(sum(len(r.preview_text) for r in rs) / n),
+        "records_without_id_skipped": outcome.skipped_records,
+    }
+
+
 def _parse(argv):
     p = argparse.ArgumentParser(description="Check the Stepstone Recruit login (no credits spent).")
     p.add_argument("--account", type=int, choices=(1, 2), default=1)
     p.add_argument("--inspect", action="store_true")
+    p.add_argument("--search", default="", help="job title for one live search (first page only)")
+    p.add_argument("--location", default="", help="location for --search")
+    p.add_argument("--distance", type=int, default=25, help="max distance in km for --search")
     p.add_argument("--force", action="store_true",
                    help="ignore the limit of 2 fresh logins per hour (risks an account lock)")
     p.add_argument("--no-proxy", action="store_true")
@@ -183,6 +212,9 @@ async def main(argv=None) -> int:
     password = _env(f"STEPSTONE_PASS_{n}")
     if not email or not password:
         print(f"STEPSTONE_EMAIL_{n} and STEPSTONE_PASS_{n} must both be set.", file=sys.stderr)
+        return 2
+    if args.search and not args.location:
+        print("--search needs --location.", file=sys.stderr)
         return 2
     if not args.no_proxy:
         missing = [v for v in ("PROXY_HOST", "PROXY_PORT", "PROXY_USER", "PROXY_PASS") if not _env(v)]
@@ -244,6 +276,17 @@ async def main(argv=None) -> int:
     try:
         ok, line = await run_check(context, page, email, password)
         print(f"{line}  [{time.monotonic() - started:.0f}s]")
+        if ok and args.search:
+            from scraper.talent_search import SearchError, search_talents
+            print(f"Searching Talent Finder: {args.search!r} in {args.location!r} "
+                  f"(max {args.distance} km; first page only, nothing unlocked)...")
+            try:
+                outcome = await search_talents(page, args.search, args.location,
+                                               max_distance_km=args.distance, max_pages=1)
+                print(json.dumps(search_summary(outcome), indent=1, ensure_ascii=False))
+            except SearchError as e:
+                print(f"SEARCH FAILED [{e.code}] {e}")
+                ok = False
         if ok and args.inspect:
             print("Inspecting Talent Finder (no search, no unlock)...")
             report = await inspect_after_login(page)

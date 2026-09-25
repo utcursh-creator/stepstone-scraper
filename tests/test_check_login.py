@@ -85,3 +85,24 @@ def test_attempts_older_than_an_hour_do_not_count(monkeypatch, tmp_path):
     now = check_login.time.time()
     (tmp_path / "attempts.json").write_text(json.dumps([now - 7200, now - 4000, now - 60]))
     assert check_login._recent_attempts(now) == [now - 60]
+
+
+async def test_the_live_search_summary_holds_counts_and_never_candidate_data(site, monkeypatch):  # noqa: F811
+    from scraper import talent_search
+    from scraper.talent_search import search_talents
+
+    async def instant(*a, **k):
+        return None
+    monkeypatch.setattr(talent_search, "human_delay", instant)
+    fake, context, page, _ = site
+    ok, _ = await check_login.run_check(context, page, EMAIL, PASSWORD)
+    assert ok
+
+    summary = check_login.search_summary(
+        await search_talents(page, "Physiotherapeut (m/w/d)", "Hamburg", max_pages=1))
+
+    assert summary["stepstone_total"] == 27 and summary["first_page_results"] == 20
+    assert summary["with_postcode"] == 20 and summary["radius_sent_km"] == 40
+    assert [r["page_number"] for r in fake.search_requests] == [0], "first page only"
+    text = json.dumps(summary)
+    assert "Test" not in text and "00000000-" not in text and "22589" not in text, "counts only"
