@@ -11,7 +11,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from models.candidate import CandidateResult, ScrapeResult
 from models.config import Settings
 from models.job import JobInput
-from scraper.auth import AuthenticationError, authenticate
+from scraper.auth import NO_FALLBACK_CODES, AuthenticationError, authenticate
 from scraper.browser import close_browser, create_browser
 from scraper.dedup import check_duplicate
 from scraper.profile import extract_profile
@@ -290,18 +290,37 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             logger.info("Authentication successful")
         except AuthenticationError as e:
             logger.error(f"Auth failed for {account['email']}: {e}")
+            failures = [f"{account['email']}: {e}"]
+            # A CAPTCHA or an edge block is about this browser and IP, not the
+            # account. Logging the second account in from the same browser right
+            # after one is another suspicious login, which is how accounts get
+            # locked. Only a rejection of THIS account's credentials falls back.
+            if e.code in NO_FALLBACK_CODES:
+                raise AuthenticationError(
+                    "All accounts failed to authenticate (the second account was NOT tried "
+                    "after this, to avoid an account lock): " + failures[0],
+                    code="AUTH_FAILED",
+                ) from e
+            authenticated = False
             for alt in accounts:
-                if alt["email"] != account["email"]:
-                    try:
-                        await authenticate(context, page, alt["email"], alt["password"], captcha_solver)
-                        account_label = f"Account {accounts.index(alt) + 1}"
-                        result.account_used = account_label
-                        logger.info(f"Authenticated with fallback account {alt['email']}")
+                if alt["email"] == account["email"]:
+                    continue
+                try:
+                    await authenticate(context, page, alt["email"], alt["password"], captcha_solver)
+                    account_label = f"Account {accounts.index(alt) + 1}"
+                    result.account_used = account_label
+                    logger.info(f"Authenticated with fallback account {alt['email']}")
+                    authenticated = True
+                    break
+                except AuthenticationError as alt_error:
+                    failures.append(f"{alt['email']}: {alt_error}")
+                    if alt_error.code in NO_FALLBACK_CODES:
                         break
-                    except AuthenticationError:
-                        continue
-            else:
-                raise AuthenticationError("All accounts failed to authenticate")
+            if not authenticated:
+                raise AuthenticationError(
+                    "All accounts failed to authenticate: " + " | ".join(failures),
+                    code="AUTH_FAILED",
+                )
 
         # 3. Search — passes max_distance_km so StepStone's backend filters by
         #    Wohnort within radius (instead of returning Dubai/Riga as keywords)
