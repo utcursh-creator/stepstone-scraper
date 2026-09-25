@@ -13,6 +13,11 @@ class CandidateResult(BaseModel):
     match_reasoning: str = ""
     unlocked: bool = False
     unlock_reason: str = ""
+    # Did THIS unlock cost a StepStone credit? Not the same as `unlocked`: a
+    # candidate Aramaz already unlocked before comes back for free
+    # (alreadyUnlocked, Stepstone Recruit). n8n logs the Credit Ledger from
+    # this, so a free re-unlock is never counted against the monthly budget.
+    credit_spent: bool = False
     cv_base64: str | None = None
     cv_filename: str = ""
     account_used: str = ""
@@ -69,3 +74,9 @@ class ScrapeResult(BaseModel):
     @property
     def candidates_unlocked(self) -> int:
         return sum(1 for c in self.candidates if c.unlocked)
+
+    @computed_field
+    @property
+    def credits_spent(self) -> int:
+        """Credits StepStone actually charged in this run (see CandidateResult.credit_spent)."""
+        return sum(1 for c in self.candidates if c.credit_spent)

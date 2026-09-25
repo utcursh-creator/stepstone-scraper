@@ -14,7 +14,7 @@ from models.job import JobInput
 from scraper.auth import NO_FALLBACK_CODES, AuthenticationError, authenticate
 from scraper.browser import close_browser, create_browser
 from scraper.dedup import check_duplicate
-from scraper.profile import extract_profile
+from scraper.talent_unlock import UnlockError, unlock_talent
 from scraper.rotation import select_account
 from scraper.talent_search import SearchError, search_talents
 from utils.delays import human_delay
@@ -543,14 +543,22 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     result.partial = True
                     break
 
-            # 4d. Unlock + extract profile (THIS CLICK SPENDS ONE CREDIT)
-            logger.info(f"Match! Extracting profile {candidate.profile_id}")
-            profile, credit_spent = await extract_profile(
-                page,
-                candidate.profile_id,
-                account_label,
-                preview_cv_url=getattr(candidate, "cv_url", ""),
-            )
+            # 4d. Unlock (THIS SPENDS ONE CREDIT, unless StepStone reports the
+            #     candidate as already unlocked: then it is free)
+            logger.info(f"Match! Unlocking {candidate.profile_id}")
+            try:
+                profile, credit_spent = await unlock_talent(
+                    page, candidate, account_label, search.criteria_id,
+                )
+            except UnlockError as e:
+                # No credits left, or the session is gone: every further
+                # unlock would fail the same way. Stop, and say why.
+                logger.error(f"Stopping the job: {e}")
+                result.partial = True
+                result.error = str(e)
+                break
+            if profile:
+                profile.credit_spent = credit_spent
             # Charge the budget for every credit StepStone actually took, NOT
             # only the ones we got data back from. These are different events:
             # the click spends the credit, and the dialog can still fail to
