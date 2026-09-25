@@ -96,3 +96,18 @@ async def test_is_duplicate_timeout_returns_false_and_warns(caplog):
     message = warnings[0].getMessage()
     assert "dedup fail-open" in message
     assert "appTEST" in message
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_a_talent_finder_id_is_looked_up_as_text_in_the_existing_field():
+    """Stepstone Recruit ids are UUIDs (Sept 2026). They live in the existing
+    'StepStone Profile ID' text field, next to the old numeric DirectSearch ids,
+    and must be compared as text, never as a number."""
+    route = respx.get("https://api.airtable.com/v0/appTEST/tblTEST").mock(
+        return_value=httpx.Response(200, json={"records": []}))
+    await is_duplicate(pat="pat_test", base_id="appTEST", table_id="tblTEST", offer_id="2525450",
+                       profile_id="712fdd83-7c9d-450e-a3f1-9bb942c373a6")
+    formula = route.calls.last.request.url.params["filterByFormula"]
+    assert formula == ('AND({Offer ID}&""="2525450",'
+                       '{StepStone Profile ID}&""="712fdd83-7c9d-450e-a3f1-9bb942c373a6")')
