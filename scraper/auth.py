@@ -66,6 +66,8 @@ CONSENT_SAVE_DECLINED = "#ccmgt_preferences_reject"
 
 # Seconds. Module constants so tests can shrink them.
 LANDING_TIMEOUT_S = 45      # app URL -> login form, or -> the app itself
+LOGIN_FORM_TIMEOUT_S = 60   # arrived on the login host -> its form has rendered
+LOGIN_BLANK_RELOAD_S = 30   # login host still without a form this long -> reload it once
 SESSION_REUSE_TIMEOUT_S = 30
 OUTCOME_TIMEOUT_S = 60      # after submit -> the app, an error, or a CAPTCHA
 POLL_INTERVAL_S = 1.0
@@ -260,7 +262,13 @@ class _SessionProof:
         self._on_app_since: float | None = None
         self._own_fetch_in_flight = False
         self._talent_finder_visits = 0
+        # Off while a fresh login lands: the cookie jar was just cleared, so
+        # Talent Finder can only bounce us to the login page, and on the live
+        # site (2026-09-25) that detour cost the login page its time budget.
+        self.nudge = True
+        self.failed_requests: list[str] = []
         page.on("response", self._on_response)
+        page.on("requestfailed", self._on_request_failed)
 
     async def _on_response(self, response) -> None:
         # Our own fetch hits the same URL. It is reported by _fetch_credits, so
@@ -280,11 +288,24 @@ class _SessionProof:
         except Exception as e:
             self.app_call = f"unreadable ({type(e).__name__})"
 
-    def detach(self) -> None:
+    def _on_request_failed(self, request) -> None:
+        # Diagnostics only: which of StepStone's own requests never arrived.
+        # Host and path, never the query (the login URL carries state values).
         try:
-            self.page.remove_listener("response", self._on_response)
+            host = _host(request.url)
+            if host.endswith("stepstone.com") and len(self.failed_requests) < 5:
+                self.failed_requests.append(
+                    f"{host}{urlparse(request.url).path} ({request.failure or 'failed'})"[:120])
         except Exception:
             pass
+
+    def detach(self) -> None:
+        for event, handler in (("response", self._on_response),
+                               ("requestfailed", self._on_request_failed)):
+            try:
+                self.page.remove_listener(event, handler)
+            except Exception:
+                pass
 
     async def check(self) -> dict | None:
         if self.credits is not None:
@@ -308,7 +329,7 @@ class _SessionProof:
         now = asyncio.get_running_loop().time()
         if self._on_app_since is None:
             self._on_app_since = now
-        elif (self.talent_finder == "not opened" and self._talent_finder_visits < 3
+        elif (self.nudge and self.talent_finder == "not opened" and self._talent_finder_visits < 3
               and now - self._on_app_since >= TALENT_FINDER_NUDGE_S):
             self._talent_finder_visits += 1
             self.talent_finder = await _open_talent_finder(self.page)
@@ -317,17 +338,22 @@ class _SessionProof:
 
     def describe(self) -> str:
         return (f"credits proof: app's own call={self.app_call}, our fetch={self.own_fetch}, "
-                f"talent finder={self.talent_finder}")
+                f"talent finder={self.talent_finder}; failed requests: "
+                f"{', '.join(self.failed_requests) or 'none'}")
 
 
 async def _decline_consent(page: Page) -> None:
     if not await _visible(page, CONSENT_PREFERENCES):
         return
+    # no_wait_after: saving the choice lets the app redirect to the login page,
+    # and a click that waits for that navigation times out over a slow proxy
+    # although the click itself worked (live, 2026-09-25). The landing loop
+    # watches where we end up anyway.
     try:
-        await page.click(CONSENT_PREFERENCES, timeout=5000)
+        await page.click(CONSENT_PREFERENCES, timeout=5000, no_wait_after=True)
         await page.wait_for_selector(CONSENT_SAVE_DECLINED, state="visible", timeout=10000)
         await human_delay(300, 700)
-        await page.click(CONSENT_SAVE_DECLINED, timeout=5000)
+        await page.click(CONSENT_SAVE_DECLINED, timeout=5000, no_wait_after=True)
         logger.info("Cookie banner: declined non-essential cookies")
     except Exception as e:
         # Left in place, the banner times the landing out, and that error
@@ -346,9 +372,17 @@ async def _login_form_visible(page: Page) -> bool:
 async def _await_landing(page: Page, proof: _SessionProof, timeout_s: float) -> tuple[str, dict | None]:
     """After opening the app URL, wait until we are either IN the app (proven by
     a balance) or ON the login form. Returns ("app", credits),
-    ("login_form", None), ("blocked", None) or ("timeout", None)."""
+    ("login_form", None), ("blocked", None) or ("timeout", None).
+
+    Reaching the login host starts a budget of its own (LOGIN_FORM_TIMEOUT_S).
+    Live, 2026-09-25: the app, the banner and the redirect used up most of one
+    shared 45s budget, and the login page, fully rendered a moment later, was
+    reported as never reached. A login page that is still blank after
+    LOGIN_BLANK_RELOAD_S is reloaded once."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
+    on_login_since: float | None = None
+    reloaded = False
     while loop.time() < deadline:
         await _decline_consent(page)
         credits = await proof.check()
@@ -358,6 +392,18 @@ async def _await_landing(page: Page, proof: _SessionProof, timeout_s: float) -> 
             return "login_form", None
         if BLOCK_PAGE_RE.search(await _page_text(page)):
             return "blocked", None
+        now = loop.time()
+        if _host(page.url) == LOGIN_HOST:
+            if on_login_since is None:
+                on_login_since = now
+                deadline = max(deadline, now + LOGIN_FORM_TIMEOUT_S)
+            elif not reloaded and now - on_login_since >= LOGIN_BLANK_RELOAD_S:
+                reloaded = True
+                logger.info("Login page still without its form: reloading it once")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    logger.warning(f"Reloading the login page failed: {type(e).__name__}")
         await asyncio.sleep(POLL_INTERVAL_S)
     return "timeout", None
 
@@ -450,7 +496,11 @@ async def _fresh_login(context: BrowserContext, page: Page, proof: _SessionProof
     # would ride along into account 2's login.
     await context.clear_cookies()
     await page.goto(APP_URL, wait_until="domcontentloaded")
-    state, credits = await _await_landing(page, proof, LANDING_TIMEOUT_S)
+    proof.nudge = False
+    try:
+        state, credits = await _await_landing(page, proof, LANDING_TIMEOUT_S)
+    finally:
+        proof.nudge = True
     if state == "app":
         return credits
     if state == "blocked":
@@ -460,7 +510,8 @@ async def _fresh_login(context: BrowserContext, page: Page, proof: _SessionProof
         )
     if state != "login_form":
         raise AuthenticationError(
-            f"never reached the login form or the app within {LANDING_TIMEOUT_S}s. "
+            f"never reached the login form or the app ({LANDING_TIMEOUT_S}s to leave the app, "
+            f"{LOGIN_FORM_TIMEOUT_S}s on the login page). "
             f"{await _describe_page(page, proof)}",
             code="LOGIN_PAGE_TIMEOUT",
         )

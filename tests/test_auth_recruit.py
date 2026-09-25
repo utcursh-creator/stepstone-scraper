@@ -100,6 +100,10 @@ LOGIN_HTML = """<!doctype html><html><head><title>Stepstone Recruit</title></hea
 <script>
 const SCENARIO = '__SCENARIO__';
 const ACCOUNTS = __ACCOUNTS__;
+// A slow proxy: the form arrives well after the page itself (live, 2026-09-25).
+const form = document.querySelector('form');
+form.style.display = 'none';
+if (__RENDER_DELAY_MS__ >= 0) setTimeout(() => { form.style.display = ''; }, __RENDER_DELAY_MS__);
 document.querySelector('form').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const email = document.querySelector('[name=email]').value;
@@ -148,6 +152,8 @@ class FakeStepstone:
         self.credits_mode = "cookie"    # cookie | app_only (the live site, 2026-09-25)
         self.credits_calls = []         # (by_app, status)
         self.redirect_delay_ms = 300    # unauthenticated app -> login page
+        self.login_render_delay_ms = 0  # login page loaded -> its form shows
+        self.login_blank_loads = 0      # this many login page loads never show the form
         self.search_requests = []
         self.search_total = 27
 
@@ -195,8 +201,11 @@ class FakeStepstone:
                                        body=APP_HTML.replace("__LOGIN_TARGET__", self.login_target)
                                        .replace("__REDIRECT_DELAY_MS__", str(self.redirect_delay_ms)))
         if host in ("login.recruit.stepstone.com", "login.stepstone-security.test"):
+            blank = self.login_blank_loads > 0
+            self.login_blank_loads -= 1
             body = (LOGIN_HTML.replace("__SCENARIO__", self.scenario)
-                    .replace("__ACCOUNTS__", json.dumps(self.accounts)))
+                    .replace("__ACCOUNTS__", json.dumps(self.accounts))
+                    .replace("__RENDER_DELAY_MS__", "-1" if blank else str(self.login_render_delay_ms)))
             return await route.fulfill(status=200, content_type="text/html", body=body)
         return await route.fulfill(status=404, body="")
 
@@ -209,6 +218,8 @@ async def site(monkeypatch, tmp_path):
     """A real headless Chromium wired to the fake StepStone. Driver stopped on
     teardown: a leaked Playwright driver is its own production incident."""
     monkeypatch.setattr(auth_mod, "LANDING_TIMEOUT_S", 8)
+    monkeypatch.setattr(auth_mod, "LOGIN_FORM_TIMEOUT_S", 8)
+    monkeypatch.setattr(auth_mod, "LOGIN_BLANK_RELOAD_S", 2)
     monkeypatch.setattr(auth_mod, "SESSION_REUSE_TIMEOUT_S", 8)
     monkeypatch.setattr(auth_mod, "OUTCOME_TIMEOUT_S", 8)
     monkeypatch.setattr(auth_mod, "POLL_INTERVAL_S", 0.2)
@@ -275,20 +286,60 @@ async def test_login_is_proven_by_the_apps_own_balance_call_when_ours_is_refused
     assert (False, 401) in fake.credits_calls, "our own fetch was refused, as on the live site"
 
 
-async def test_a_talent_finder_visit_before_login_does_not_use_up_the_one_after(site):
-    """The second live check, 2026-09-25: the redirect to the login page was
-    slow, so Talent Finder was opened BEFORE logging in. After the login the
-    app landed on the dashboard, which never loads the balance: without a fresh
-    Talent Finder visit after the login, a good login times out."""
+async def test_a_slow_redirect_before_login_does_not_detour_through_talent_finder(site):
+    """Live, 2026-09-25: the redirect to the login page was slow, so Talent
+    Finder was opened BEFORE logging in. With the cookie jar just cleared that
+    visit can only bounce back to the login page, and on the third live check
+    the detour cost the login page its time budget. After the login, Talent
+    Finder must still be opened (the dashboard never loads the balance)."""
     fake, context, page, _ = site
     fake.credits_mode = "app_only"
-    fake.redirect_delay_ms = 1500   # slower than the 0.6s nudge -> a visit before login
+    fake.redirect_delay_ms = 1500   # slower than the 0.6s nudge
 
     credits = await authenticate(context, page, EMAIL, PASSWORD)
 
     assert credits["remainingCredits"] == 147
-    tf_visits = [h for h in fake.hits if h == ("recruit.stepstone.com", "/talent-sourcing")]
-    assert len(tf_visits) >= 2, "one Talent Finder visit before the login and a fresh one after it"
+    tf_visits = [i for i, h in enumerate(fake.hits) if h == ("recruit.stepstone.com", "/talent-sourcing")]
+    first_login = fake.hits.index(fake.login_page_hits()[0])
+    assert tf_visits, "Talent Finder must be opened after the login, for the balance"
+    assert all(i > first_login for i in tf_visits), "no Talent Finder visit before the login page"
+
+
+async def test_the_login_page_gets_its_own_time_after_a_slow_app(site, monkeypatch):
+    """Live, 2026-09-25: the app and its redirect took most of the landing
+    budget, and the login form rendered just after it ran out. Each leg of the
+    way now has its own budget (8s each in these tests; ~11s in total here)."""
+    fake, context, page, _ = site
+    monkeypatch.setattr(auth_mod, "LOGIN_BLANK_RELOAD_S", 30)  # slow, not blank: no reload
+    fake.redirect_delay_ms = 5000
+    fake.login_render_delay_ms = 6000
+
+    credits = await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
+
+
+async def test_a_login_page_that_stays_blank_is_reloaded_once(site):
+    fake, context, page, _ = site
+    fake.login_blank_loads = 1
+
+    credits = await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
+    assert len(fake.login_page_hits()) == 2, "one blank load, one reload"
+
+
+async def test_a_login_page_that_never_renders_times_out_after_one_reload(site):
+    fake, context, page, _ = site
+    fake.login_blank_loads = 99
+
+    with pytest.raises(AuthenticationError) as err:
+        await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert err.value.code == "LOGIN_PAGE_TIMEOUT"
+    assert len(fake.login_page_hits()) == 2, "exactly one reload, never a reload loop"
+    assert "failed requests:" in str(err.value)
+    assert await _submits(page) == 0
 
 
 async def test_a_failed_proof_says_what_both_balance_routes_saw(site, monkeypatch):
