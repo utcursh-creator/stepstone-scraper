@@ -28,6 +28,7 @@ import main as main_mod
 from models.job import JobInput
 from scraper import auth as auth_mod
 from scraper.auth import AuthenticationError, authenticate
+from tests.fakes import fake_search_outcome
 
 EMAIL = "recruiter@example.test"
 PASSWORD = "pw-Secret-123"
@@ -147,6 +148,8 @@ class FakeStepstone:
         self.credits_mode = "cookie"    # cookie | app_only (the live site, 2026-09-25)
         self.credits_calls = []         # (by_app, status)
         self.redirect_delay_ms = 300    # unauthenticated app -> login page
+        self.search_requests = []
+        self.search_total = 27
 
     async def handle(self, route):
         req = route.request
@@ -157,6 +160,27 @@ class FakeStepstone:
         if host == "recruit.stepstone.com":
             if self.scenario == "blocked":
                 return await route.fulfill(status=403, content_type="text/html", body=BLOCK_HTML)
+            if path.startswith("/recruiter/talent-sourcing/api/v1/autosuggestion/locations"):
+                return await route.fulfill(status=200, content_type="application/json",
+                                           body=json.dumps([{"name": "Hamburg"}]))
+            if path.startswith("/recruiter/talent-sourcing/api/v1/search"):
+                headers = await req.all_headers()
+                session_ok = "tf_session=session-for-" in headers.get("cookie", "")
+                self.search_requests.append({"method": req.method, "json": req.post_data_json,
+                                             "cookie_ok": session_ok,
+                                             "page_number": int(path.split("pageNumber=")[1].split("&")[0])})
+                if not session_ok:
+                    return await route.fulfill(status=401, content_type="application/json", body="{}")
+                n = self.search_requests[-1]["page_number"]
+                size, total = 20, self.search_total
+                content = [{"id": f"00000000-0000-4000-8000-{n * size + i:012d}", "hasCv": True, "isLocked": True,
+                            "currentJobTitle": "Physiotherapeutin",
+                            "personalInfo": {"firstName": "Test", "lastName": "T.",
+                                             "address": {"city": "Hamburg", "postalCode": "22589", "country": "DE"}}}
+                           for i in range(max(0, min(size, total - n * size)))]
+                return await route.fulfill(status=200, content_type="application/json", body=json.dumps(
+                    {"content": content, "totalElements": total, "totalPages": -(-total // size),
+                     "number": n, "size": size, "uniqueSearchCriteriaId": 68799}))
             if path.startswith("/recruiter/talent-sourcing/api/v1/credits"):
                 headers = await req.all_headers()
                 cookie = headers.get("cookie", "")
@@ -416,7 +440,7 @@ def _wire_main(monkeypatch, auth_behaviour):
         return dict(CREDITS)
 
     async def fake_search(*a, **k):
-        return [], 25
+        return fake_search_outcome([])
 
     accounts = [{"email": EMAIL, "password": PASSWORD}, {"email": OTHER_EMAIL, "password": OTHER_PASSWORD}]
     monkeypatch.setattr(type(main_mod.settings), "get_accounts", lambda self: accounts)
@@ -425,7 +449,7 @@ def _wire_main(monkeypatch, auth_behaviour):
     monkeypatch.setattr(main_mod, "create_browser", fake_browser)
     monkeypatch.setattr(main_mod, "close_browser", fake_close)
     monkeypatch.setattr(main_mod, "authenticate", fake_auth)
-    monkeypatch.setattr(main_mod, "search_candidates", fake_search)
+    monkeypatch.setattr(main_mod, "search_talents", fake_search)
     return calls
 
 

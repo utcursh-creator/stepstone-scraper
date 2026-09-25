@@ -18,6 +18,7 @@ import pytest
 
 import main as main_mod
 from models.job import JobInput
+from tests.fakes import fake_search_outcome
 from utils.openrouter import EvalResult
 
 
@@ -58,7 +59,7 @@ def _wire_common(monkeypatch, cards):
         return None
 
     async def fake_search(page, job_title, location, max_distance_km=25, keywords=None):
-        return list(cards), 25
+        return fake_search_outcome(cards)
 
     async def fake_dup(*a, **k):
         return False  # nothing is a pre-unlock duplicate
@@ -68,7 +69,7 @@ def _wire_common(monkeypatch, cards):
     monkeypatch.setattr(main_mod, "create_browser", fake_browser)
     monkeypatch.setattr(main_mod, "authenticate", fake_auth)
     monkeypatch.setattr(main_mod, "close_browser", fake_close)
-    monkeypatch.setattr(main_mod, "search_candidates", fake_search)
+    monkeypatch.setattr(main_mod, "search_talents", fake_search)
     monkeypatch.setattr(main_mod, "check_duplicate", fake_dup)
     monkeypatch.setattr(main_mod, "calculate_distance_km", lambda w, j: 10.0)  # within radius → reaches eval
 
@@ -144,7 +145,7 @@ async def test_mid_scrape_crash_sets_result_error(monkeypatch):
     async def exploding_search(*a, **k):
         raise RuntimeError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED")
 
-    monkeypatch.setattr(main_mod, "search_candidates", exploding_search)
+    monkeypatch.setattr(main_mod, "search_talents", exploding_search)
 
     result = await main_mod.run_scrape(_job())
 

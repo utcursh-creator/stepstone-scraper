@@ -16,7 +16,7 @@ from scraper.browser import close_browser, create_browser
 from scraper.dedup import check_duplicate
 from scraper.profile import extract_profile
 from scraper.rotation import select_account
-from scraper.search import search_candidates
+from scraper.talent_search import SearchError, search_talents
 from utils.delays import human_delay
 from utils.geocode import (
     clear_cache,
@@ -322,22 +322,30 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     code="AUTH_FAILED",
                 )
 
-        # 3. Search — passes max_distance_km so StepStone's backend filters by
-        #    Wohnort within radius (instead of returning Dubai/Riga as keywords)
-        logger.info(f"Searching: {job.job_title} in {job.location} (radius={job.max_distance_km}km)")
-        candidates, radius = await search_candidates(
-            page, job.job_title, job.location,
-            max_distance_km=job.max_distance_km,
-            keywords=job.keywords,
-        )
-        if job.keywords:
-            logger.info(f"Applied job-specific keywords: {job.keywords}")
+        # 3. Search Talent Finder. StepStone only offers 40/60/80/100/150 km, so it
+        #    gets the smallest radius that covers the job; the exact limit is the
+        #    distance gate below, on each candidate's postcode.
+        logger.info(f"Searching: {job.job_title} in {job_location_base} (max {job.max_distance_km}km)")
+        try:
+            search = await search_talents(
+                page, job.job_title, job_location_base,
+                max_distance_km=job.max_distance_km,
+                keywords=job.keywords,
+            )
+        except SearchError as e:
+            # A failed search is an abort, never "found nothing": it must reach
+            # n8n's error lane, not the client's Slack as a green zero.
+            logger.error(f"Search failed: {e}")
+            result.partial = True
+            result.error = str(e)
+            return result
+        if search.total == 0:
+            logger.info("StepStone reports 0 matching candidates: a genuine empty result, not a failure.")
         logger.info(
-            f"Found {len(candidates)} candidates "
-            f"(StepStone backend radius: {radius}km, request: {job.max_distance_km}km)"
+            f"Found {search.total} candidates on StepStone "
+            f"(radius sent: {search.radius_km or 'Optimiert'} km, local limit {job.max_distance_km} km"
+            f"{', without keywords (fallback)' if search.keyword_fallback else ''})"
         )
-        for c in candidates:
-            logger.info(f"  card {c.profile_id}: preview_text={len(c.preview_text)} chars, cv_url={'yes' if c.cv_url else 'no'}")
 
         # 4. Process each candidate.
         # Effective per-job cap = min(what n8n requested, the server ceiling).
@@ -350,7 +358,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         )
         processed = 0
         consecutive_eval_errors = 0
-        for candidate in candidates:
+        async for candidate in search.iterate():
             if processed >= effective_max_candidates:
                 logger.info(
                     f"Reached per-job cap ({effective_max_candidates}); stopping this job."
