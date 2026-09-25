@@ -66,10 +66,37 @@ async def test_inspection_reports_the_apps_headers_our_requests_and_the_form(sit
     assert "Umkreis: 25 km" in report["search_form_with_erweitert_open"]["distance_texts"]
 
 
+async def test_a_saved_session_is_not_limited_because_it_types_no_password(monkeypatch, tmp_path):
+    """Reusing the check's saved session is not a password login, so the hourly
+    limit does not block it (the browser part is stubbed here)."""
+    monkeypatch.setattr(check_login, "ATTEMPT_LOG", str(tmp_path / "attempts.json"))
+    monkeypatch.setattr(check_login, "SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr(check_login, "load_dotenv", lambda: None)
+    monkeypatch.setenv("STEPSTONE_EMAIL_1", "a@example.test")
+    monkeypatch.setenv("STEPSTONE_PASS_1", "x")
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "account-1.json").write_text("[]")
+    now = check_login.time.time()
+    (tmp_path / "attempts.json").write_text(json.dumps([now - 1500, now - 600]))
+
+    class Stop(Exception):
+        pass
+
+    async def no_browser(*a, **k):
+        raise Stop()
+    import scraper.browser
+    monkeypatch.setattr(scraper.browser, "create_browser", no_browser)
+    with pytest.raises(Stop):   # got past the limit, stopped before any browser
+        await check_login.main([])
+    assert json.loads((tmp_path / "attempts.json").read_text()) == [now - 1500, now - 600], \
+        "a session reuse is not recorded as a password login"
+
+
 async def test_a_third_fresh_login_within_an_hour_is_refused(monkeypatch, tmp_path, capsys):
     """Three fresh logins in ~25 min tripped StepStone's bot check (2026-09-25).
     The limit is enforced before any browser opens."""
     monkeypatch.setattr(check_login, "ATTEMPT_LOG", str(tmp_path / "attempts.json"))
+    monkeypatch.setattr(check_login, "SESSION_DIR", str(tmp_path / "no-sessions"))
     monkeypatch.setattr(check_login, "load_dotenv", lambda: None)
     monkeypatch.setenv("STEPSTONE_EMAIL_1", "a@example.test")
     monkeypatch.setenv("STEPSTONE_PASS_1", "x")

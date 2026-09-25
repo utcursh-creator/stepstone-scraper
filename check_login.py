@@ -2,9 +2,10 @@
 
 Costs no StepStone credits. It logs in exactly the way a job does (the same
 headless Chromium and the same proxy set-up as scraper/browser.py), prints the
-result and the credit balance, and exits. It never reads or overwrites the
-scraper's saved sessions: it always does a fresh login, which is the path that
-matters.
+result and the credit balance, and exits. It keeps its own saved session (in
+~/.cache, never the scraper's sessions/ folder) and reuses it on the next run, so
+repeated checks do not keep typing the password: fresh logins are what tripped
+StepStone's bot check on 2026-09-25. --fresh forces a new login.
 
     railway run .venv/bin/python check_login.py       # with Railway's variables
     .venv/bin/python check_login.py                     # with a local .env
@@ -15,6 +16,7 @@ Options:  --inspect     after logging in, open Talent Finder and report (structu
           --search "Physiotherapeut" --location Hamburg [--distance 25]
                         after logging in, run ONE real Talent Finder search
                         (first page only, nothing unlocked) and print counts
+          --fresh       forget the saved session and log in from scratch
           --account 2   check the second account
           --no-proxy    log in without the proxy (to tell a proxy problem apart)
           --headed      show the browser window
@@ -28,7 +30,6 @@ import logging
 import os
 import re
 import sys
-import tempfile
 import time
 from urllib.parse import urlparse
 
@@ -149,6 +150,7 @@ async def inspect_after_login(page) -> dict:
 
 
 ATTEMPT_LOG = os.path.join(os.path.expanduser("~"), ".cache", "stepstone-login-check.json")
+SESSION_DIR = os.path.join(os.path.expanduser("~"), ".cache", "stepstone-login-check-sessions")
 MAX_ATTEMPTS_PER_HOUR = 2
 
 
@@ -197,6 +199,7 @@ def _parse(argv):
     p.add_argument("--search", default="", help="job title for one live search (first page only)")
     p.add_argument("--location", default="", help="location for --search")
     p.add_argument("--distance", type=int, default=25, help="max distance in km for --search")
+    p.add_argument("--fresh", action="store_true", help="forget the saved session and log in from scratch")
     p.add_argument("--force", action="store_true",
                    help="ignore the limit of 2 fresh logins per hour (risks an account lock)")
     p.add_argument("--no-proxy", action="store_true")
@@ -227,20 +230,24 @@ async def main(argv=None) -> int:
     # an account gets locked. Checked before any browser opens.
     now = time.time()
     recent = _recent_attempts(now)
-    if len(recent) >= MAX_ATTEMPTS_PER_HOUR and not args.force:
+    will_type_password = args.fresh or not os.path.exists(os.path.join(SESSION_DIR, f"account-{n}.json"))
+    if will_type_password and len(recent) >= MAX_ATTEMPTS_PER_HOUR and not args.force:
         wait_min = int((min(recent) + 3600 - now) / 60) + 1
         print(f"Refusing: {len(recent)} fresh logins already in the last hour. StepStone's bot "
               f"check trips on repeated logins from changing IPs. Try again in ~{wait_min} min "
               f"(or --force, at the risk of an account lock).", file=sys.stderr)
         return 2
-    _record_attempt(now)
+    if will_type_password:
+        _record_attempt(now)
 
     from scraper import auth
     from scraper.browser import create_browser
 
-    # Keep the check's session away from the scraper's own sessions/ folder.
-    scratch = tempfile.mkdtemp(prefix="login-check-")
-    auth._session_path = lambda _email: os.path.join(scratch, "session.json")
+    # The check's own session store: kept between runs, away from sessions/.
+    session_file = os.path.join(SESSION_DIR, f"account-{n}.json")
+    if args.fresh and os.path.exists(session_file):
+        os.remove(session_file)
+    auth._session_path = lambda _email: session_file
 
     if args.no_proxy:
         from patchright.async_api import async_playwright
