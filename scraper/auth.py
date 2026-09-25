@@ -248,6 +248,7 @@ class _SessionProof:
         self.talent_finder = "not opened"
         self._on_app_since: float | None = None
         self._own_fetch_in_flight = False
+        self._talent_finder_visits = 0
         page.on("response", self._on_response)
 
     async def _on_response(self, response) -> None:
@@ -279,6 +280,11 @@ class _SessionProof:
             return self.credits
         if not _on_app(self.page.url):
             self._on_app_since = None
+            # A Talent Finder visit made BEFORE logging in (slow redirect to the
+            # login page, seen live on 2026-09-25) proves nothing about the
+            # session that follows. Allow a fresh one after every login-page visit.
+            if _host(self.page.url) == LOGIN_HOST and self.talent_finder != "not opened":
+                self.talent_finder = "not opened"
             return None
         self._own_fetch_in_flight = True
         try:
@@ -291,7 +297,9 @@ class _SessionProof:
         now = asyncio.get_running_loop().time()
         if self._on_app_since is None:
             self._on_app_since = now
-        elif self.talent_finder == "not opened" and now - self._on_app_since >= TALENT_FINDER_NUDGE_S:
+        elif (self.talent_finder == "not opened" and self._talent_finder_visits < 3
+              and now - self._on_app_since >= TALENT_FINDER_NUDGE_S):
+            self._talent_finder_visits += 1
             self.talent_finder = await _open_talent_finder(self.page)
             logger.info(f"In the app without a balance yet: opened Talent Finder ({self.talent_finder})")
         return self.credits

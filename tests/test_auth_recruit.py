@@ -64,7 +64,7 @@ function boot() {
     }
     return;
   }
-  setTimeout(() => { location.href = '__LOGIN_TARGET__'; }, 300);
+  setTimeout(() => { location.href = '__LOGIN_TARGET__'; }, __REDIRECT_DELAY_MS__);
 }
 function consent(level) {
   document.cookie = 'consent_level=' + level + '; path=/';
@@ -134,6 +134,7 @@ class FakeStepstone:
         self.credits_cookies = []       # cookie header seen by the credits API
         self.credits_mode = "cookie"    # cookie | app_only (the live site, 2026-09-25)
         self.credits_calls = []         # (by_app, status)
+        self.redirect_delay_ms = 300    # unauthenticated app -> login page
 
     async def handle(self, route):
         req = route.request
@@ -155,7 +156,8 @@ class FakeStepstone:
                     return await route.fulfill(status=200, content_type="application/json", body=json.dumps(CREDITS))
                 return await route.fulfill(status=401, content_type="application/json", body="{}")
             return await route.fulfill(status=200, content_type="text/html",
-                                       body=APP_HTML.replace("__LOGIN_TARGET__", self.login_target))
+                                       body=APP_HTML.replace("__LOGIN_TARGET__", self.login_target)
+                                       .replace("__REDIRECT_DELAY_MS__", str(self.redirect_delay_ms)))
         if host in ("login.recruit.stepstone.com", "login.stepstone-security.test"):
             body = (LOGIN_HTML.replace("__SCENARIO__", self.scenario)
                     .replace("__ACCOUNTS__", json.dumps(self.accounts)))
@@ -235,6 +237,22 @@ async def test_login_is_proven_by_the_apps_own_balance_call_when_ours_is_refused
     assert ("recruit.stepstone.com", "/talent-sourcing") in fake.hits, "Talent Finder must be opened"
     assert (True, 200) in fake.credits_calls, "the balance must come from the app's own call"
     assert (False, 401) in fake.credits_calls, "our own fetch was refused, as on the live site"
+
+
+async def test_a_talent_finder_visit_before_login_does_not_use_up_the_one_after(site):
+    """The second live check, 2026-09-25: the redirect to the login page was
+    slow, so Talent Finder was opened BEFORE logging in. After the login the
+    app landed on the dashboard, which never loads the balance: without a fresh
+    Talent Finder visit after the login, a good login times out."""
+    fake, context, page, _ = site
+    fake.credits_mode = "app_only"
+    fake.redirect_delay_ms = 1500   # slower than the 0.6s nudge -> a visit before login
+
+    credits = await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
+    tf_visits = [h for h in fake.hits if h == ("recruit.stepstone.com", "/talent-sourcing")]
+    assert len(tf_visits) >= 2, "one Talent Finder visit before the login and a fresh one after it"
 
 
 async def test_a_failed_proof_says_what_both_balance_routes_saw(site, monkeypatch):
