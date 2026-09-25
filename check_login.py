@@ -145,10 +145,31 @@ async def inspect_after_login(page) -> dict:
     return report
 
 
+ATTEMPT_LOG = os.path.join(os.path.expanduser("~"), ".cache", "stepstone-login-check.json")
+MAX_ATTEMPTS_PER_HOUR = 2
+
+
+def _recent_attempts(now: float) -> list[float]:
+    try:
+        with open(ATTEMPT_LOG) as f:
+            return [t for t in json.load(f) if now - t < 3600]
+    except (OSError, ValueError):
+        return []
+
+
+def _record_attempt(now: float) -> None:
+    attempts = _recent_attempts(now) + [now]
+    os.makedirs(os.path.dirname(ATTEMPT_LOG), exist_ok=True)
+    with open(ATTEMPT_LOG, "w") as f:
+        json.dump(attempts, f)
+
+
 def _parse(argv):
     p = argparse.ArgumentParser(description="Check the Stepstone Recruit login (no credits spent).")
     p.add_argument("--account", type=int, choices=(1, 2), default=1)
     p.add_argument("--inspect", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="ignore the limit of 2 fresh logins per hour (risks an account lock)")
     p.add_argument("--no-proxy", action="store_true")
     p.add_argument("--headed", action="store_true")
     return p.parse_args(argv)
@@ -168,6 +189,19 @@ async def main(argv=None) -> int:
         if missing:
             print(f"Missing proxy variables: {', '.join(missing)} (or pass --no-proxy).", file=sys.stderr)
             return 2
+
+    # Every run is a FRESH login from a new proxy IP. Three of those in ~25 min
+    # tripped StepStone's bot check on 2026-09-25, and repeated tries are how
+    # an account gets locked. Checked before any browser opens.
+    now = time.time()
+    recent = _recent_attempts(now)
+    if len(recent) >= MAX_ATTEMPTS_PER_HOUR and not args.force:
+        wait_min = int((min(recent) + 3600 - now) / 60) + 1
+        print(f"Refusing: {len(recent)} fresh logins already in the last hour. StepStone's bot "
+              f"check trips on repeated logins from changing IPs. Try again in ~{wait_min} min "
+              f"(or --force, at the risk of an account lock).", file=sys.stderr)
+        return 2
+    _record_attempt(now)
 
     from scraper import auth
     from scraper.browser import create_browser

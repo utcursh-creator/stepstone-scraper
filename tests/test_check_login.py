@@ -1,6 +1,8 @@
 """check_login.py drives the real authenticate() and must report the outcome in
 one line without ever printing the password. Exercised against the same fake
 StepStone as tests/test_auth_recruit.py, in a real headless Chromium."""
+import json
+
 import pytest
 
 import check_login
@@ -62,3 +64,24 @@ async def test_inspection_reports_the_apps_headers_our_requests_and_the_form(sit
     placeholders = [i["placeholder"] for i in report["search_form"]["inputs"]]
     assert "Ort oder Postleitzahl eingeben" in placeholders
     assert "Umkreis: 25 km" in report["search_form_with_erweitert_open"]["distance_texts"]
+
+
+async def test_a_third_fresh_login_within_an_hour_is_refused(monkeypatch, tmp_path, capsys):
+    """Three fresh logins in ~25 min tripped StepStone's bot check (2026-09-25).
+    The limit is enforced before any browser opens."""
+    monkeypatch.setattr(check_login, "ATTEMPT_LOG", str(tmp_path / "attempts.json"))
+    monkeypatch.setattr(check_login, "load_dotenv", lambda: None)
+    monkeypatch.setenv("STEPSTONE_EMAIL_1", "a@example.test")
+    monkeypatch.setenv("STEPSTONE_PASS_1", "x")
+    now = check_login.time.time()
+    (tmp_path / "attempts.json").write_text(json.dumps([now - 1500, now - 600]))
+
+    assert await check_login.main(["--no-proxy"]) == 2
+    assert "Refusing: 2 fresh logins already in the last hour" in capsys.readouterr().err
+
+
+def test_attempts_older_than_an_hour_do_not_count(monkeypatch, tmp_path):
+    monkeypatch.setattr(check_login, "ATTEMPT_LOG", str(tmp_path / "attempts.json"))
+    now = check_login.time.time()
+    (tmp_path / "attempts.json").write_text(json.dumps([now - 7200, now - 4000, now - 60]))
+    assert check_login._recent_attempts(now) == [now - 60]

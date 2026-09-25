@@ -113,6 +113,12 @@ document.querySelector('form').addEventListener('submit', (ev) => {
       c.innerHTML = '<iframe src="https://captcha.provider.test/challenge" style="width:300px;height:80px"></iframe>';
       return;
     }
+    if (SCENARIO === 'code_error') {  // the live bot-check failure, 2026-09-25
+      const d = document.getElementById('err');
+      d.setAttribute('role', 'alert');
+      d.textContent = 'Der angegebene Code ist falsch. Bitte versuchen Sie es erneut.';
+      return;
+    }
     if (SCENARIO === 'reject' || ACCOUNTS[email] !== password) {
       const d = document.getElementById('err');
       d.setAttribute('role', 'alert');
@@ -343,6 +349,20 @@ async def test_a_captcha_fails_loudly_and_is_never_worked_around(site):
     assert err.value.code == "LOGIN_CAPTCHA"
     assert "captcha.provider.test" in str(err.value), "the provider is named so it can be handled later"
     assert await _submits(page) == 1, "exactly one submit: no retry loop into a CAPTCHA"
+
+
+async def test_a_code_error_without_a_code_field_is_a_captcha_not_a_wrong_password(site):
+    """Live, 2026-09-25: 'Der angegebene Code ist falsch' on a form with no code
+    field. Filed as LOGIN_REJECTED it would trigger a second-account login."""
+    fake, context, page, _ = site
+    fake.scenario = "code_error"
+
+    with pytest.raises(AuthenticationError) as err:
+        await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert err.value.code == "LOGIN_CAPTCHA"
+    assert "Der angegebene Code ist falsch" in str(err.value)
+    assert await _submits(page) == 1, "exactly one submit"
 
 
 async def test_an_edge_block_page_is_reported_as_blocked(site):

@@ -79,6 +79,17 @@ BLOCK_PAGE_RE = re.compile(
 )
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
+# An error about a CODE on a form that has no code field is the login's bot
+# check (an invisible CAPTCHA) failing, not a wrong password. Seen live on
+# 2026-09-25 after three fresh logins in ~25 min from three proxy IPs:
+# "Der angegebene Code ist falsch. Bitte versuchen Sie es erneut."
+# Filed as LOGIN_REJECTED it would send main.py straight to the second account:
+# one more suspicious login from the same browser.
+CAPTCHA_ERROR_RE = re.compile(
+    r"\bcode\b|captcha|roboter|robot|sicherheitspr[uü]fung|verify (that )?you('| a)re (a )?human",
+    re.IGNORECASE,
+)
+
 # Codes that are about this browser/IP, not the account. Trying the second
 # account from the same browser straight after one of these is one more
 # suspicious login, and repeated suspicious logins are how accounts get locked.
@@ -404,6 +415,14 @@ async def _await_outcome(page: Page, proof: _SessionProof, email: str) -> dict:
                 error_text = await page.evaluate(_LOGIN_ERROR_JS)
             except Exception:
                 error_text = ""
+            if error_text and CAPTCHA_ERROR_RE.search(error_text):
+                raise AuthenticationError(
+                    f"StepStone's login bot check failed for {email}: "
+                    f"{EMAIL_RE.sub('<email>', error_text)!r}. No code field is shown, so this is "
+                    f"an invisible CAPTCHA, not the password. Do not retry in a loop: every "
+                    f"further attempt raises the risk of an account lock.",
+                    code="LOGIN_CAPTCHA",
+                )
             if error_text:
                 raise AuthenticationError(
                     f"StepStone rejected the login for {email}: "
