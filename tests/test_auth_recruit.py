@@ -57,6 +57,12 @@ function boot() {
     // Like the real app: the dashboard never loads the balance; Talent Finder
     // does, with a header the app adds itself (a bare fetch does not carry it).
     if (location.pathname.startsWith('/talent-sourcing')) {
+      document.getElementById('app').innerHTML += '<div data-testid="search-box">'
+        + '<input type="text" placeholder="Jobtitel, Stichwort oder boolesche Operatoren ein">'
+        + '<input type="text" placeholder="Ort oder Postleitzahl eingeben">'
+        + '<button aria-label="Suchen">S</button><button id="adv">Erweitert</button>'
+        + '<div id="advpanel" style="display:none"><label>Umkreis: 25 km</label></div></div>';
+      document.getElementById('adv').onclick = () => { document.getElementById('advpanel').style.display = 'block'; };
       const xhr = new XMLHttpRequest();  // the real app loads it with XHR, not fetch
       xhr.open('GET', '/recruiter/talent-sourcing/api/v1/credits');
       xhr.setRequestHeader('x-app-auth', 'yes');

@@ -41,3 +41,24 @@ def test_variables_are_found_in_either_case_like_the_scraper_reads_them(monkeypa
     assert check_login._env("STEPSTONE_EMAIL_1") == "lower@example.test"
     assert check_login._env("proxy_host") == "proxy.test"
     assert check_login._env("NOT_SET_ANYWHERE", "fallback") == "fallback"
+
+
+async def test_inspection_reports_the_apps_headers_our_requests_and_the_form(site):  # noqa: F811
+    """Names only, never values; both of our request routes are tried; the
+    search form is read from the Talent Finder page."""
+    fake, context, page, _ = site
+    fake.credits_mode = "app_only"
+    ok, _ = await check_login.run_check(context, page, EMAIL, PASSWORD)
+    assert ok
+
+    report = await check_login.inspect_after_login(page)
+
+    app = [c for c in report["app_api_calls"] if c["path"].endswith("/credits")]
+    assert app and "x-app-auth" in app[0]["header_names"] and app[0]["via"] == "xhr"
+    assert report["our_balance_request_from_isolated_world"] == "401"
+    assert report["our_balance_request_from_page_world"] == "401"
+    assert any(n.startswith("tf_session") for n in report["app_host_cookie_names"])
+    assert "yes" not in str(report["app_api_calls"]), "header VALUES must never be reported"
+    placeholders = [i["placeholder"] for i in report["search_form"]["inputs"]]
+    assert "Ort oder Postleitzahl eingeben" in placeholders
+    assert "Umkreis: 25 km" in report["search_form_with_erweitert_open"]["distance_texts"]

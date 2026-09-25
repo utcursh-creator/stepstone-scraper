@@ -14,3 +14,4 @@ venv/
 stepstone_cookies.json
 step0_*.py
 step05_*.py
+login-inspect-*.json

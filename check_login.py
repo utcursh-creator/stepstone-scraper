@@ -9,7 +9,10 @@ matters.
     railway run .venv/bin/python check_login.py       # with Railway's variables
     .venv/bin/python check_login.py                     # with a local .env
 
-Options:  --account 2   check the second account
+Options:  --inspect     after logging in, open Talent Finder and report (structure
+                        only, no search, no unlock) how the app calls its API
+                        and how the search form is built; saves a JSON file
+          --account 2   check the second account
           --no-proxy    log in without the proxy (to tell a proxy problem apart)
           --headed      show the browser window
 
@@ -17,11 +20,14 @@ Exit code: 0 logged in, 1 login failed (the code says why), 2 misconfigured.
 """
 import argparse
 import asyncio
+import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -51,9 +57,98 @@ async def run_check(context, page, email: str, password: str) -> tuple[bool, str
         return False, f"FAILED [{e.code}] {e}"
 
 
+_FORM_JS = """
+() => {
+  const vis = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const chain = (e) => { const out = []; let x = e.parentElement;
+    for (let i = 0; i < 8 && x; i++, x = x.parentElement) { const t = x.getAttribute('data-testid'); if (t) out.push(t); }
+    return out; };
+  const attrs = (e) => ({ tag: e.tagName.toLowerCase(), type: e.getAttribute('type'), name: e.getAttribute('name'),
+    role: e.getAttribute('role'), placeholder: e.getAttribute('placeholder'), aria_label: e.getAttribute('aria-label'),
+    testid: e.getAttribute('data-testid'), genesis: e.getAttribute('data-genesis-element'),
+    autocomplete: e.getAttribute('aria-autocomplete'), text: (e.innerText || '').trim().slice(0, 40),
+    ancestor_testids: chain(e) });
+  return {
+    path: location.pathname,
+    inputs: [...document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"]')].filter(vis).map(attrs),
+    buttons: [...document.querySelectorAll('button, [role="button"]')].filter(vis).map(attrs).slice(0, 40),
+    forms: [...document.querySelectorAll('form')].map((f) => ({ testid: f.getAttribute('data-testid'),
+      role: f.getAttribute('role'), inputs: f.querySelectorAll('input').length })),
+    distance_texts: [...document.querySelectorAll('label, span, div, option, button')]
+      .filter((e) => vis(e) && e.children.length === 0 && /umkreis|entfernung|radius|\\bkm\\b/i.test(e.innerText || ''))
+      .map((e) => (e.innerText || '').trim().slice(0, 60)).slice(0, 20),
+  };
+}
+"""
+
+
+def _mask(text: str) -> str:
+    return re.sub(r"[A-Za-z0-9_-]{24,}", "{id}", text)
+
+
+async def inspect_after_login(page) -> dict:
+    """What the search build needs to know, read on the REAL Talent Finder page
+    after login: which headers the app's own API calls carry (names only, never
+    values), whether a request WE make is accepted (from patchright's isolated
+    world and from the page's own world), the session cookie names, and how the
+    search form is built. No search is run and nothing is unlocked; the Talent
+    Finder start page holds no candidate data."""
+    from scraper import auth
+
+    seen = []
+
+    def on_request(request):
+        p = urlparse(request.url)
+        if (p.hostname or "") == auth.APP_HOST and p.path.startswith("/recruiter/talent-sourcing/api/"):
+            seen.append(request)
+
+    page.on("request", on_request)
+    await page.goto(auth.TALENT_FINDER_URL, wait_until="domcontentloaded")
+    await asyncio.sleep(8)  # let the app make its own start-up calls
+    page.remove_listener("request", on_request)
+
+    app_calls = []
+    for request in seen:
+        try:
+            names = sorted(await request.all_headers())
+            response = await request.response()
+            app_calls.append({"method": request.method, "path": urlparse(request.url).path,
+                              "via": request.resource_type, "status": response.status if response else None,
+                              "header_names": names})
+        except Exception as e:
+            app_calls.append({"path": urlparse(request.url).path, "error": type(e).__name__})
+
+    async def own(isolated: bool) -> str:
+        try:
+            res = await page.evaluate(auth._CREDITS_JS, auth.CREDITS_PATH, isolated_context=isolated)
+            return str(res.get("status")) if isinstance(res, dict) else "no result"
+        except Exception as e:
+            return f"failed ({type(e).__name__})"
+
+    report = {
+        "app_api_calls": app_calls,
+        "our_balance_request_from_isolated_world": await own(True),
+        "our_balance_request_from_page_world": await own(False),
+        "app_host_cookie_names": sorted(
+            _mask(c["name"]) + (" [HttpOnly]" if c.get("httpOnly") else "")
+            for c in await page.context.cookies(f"https://{auth.APP_HOST}")),
+        "search_form": await page.evaluate(_FORM_JS),
+    }
+    try:  # the "Erweitert" panel: where a distance / radius setting would live
+        advanced = page.get_by_role("button", name=re.compile(r"erweitert", re.IGNORECASE)).first
+        if await advanced.count():
+            await advanced.click(timeout=5000)
+            await asyncio.sleep(2)
+            report["search_form_with_erweitert_open"] = await page.evaluate(_FORM_JS)
+    except Exception as e:
+        report["erweitert"] = f"could not open ({type(e).__name__})"
+    return report
+
+
 def _parse(argv):
     p = argparse.ArgumentParser(description="Check the Stepstone Recruit login (no credits spent).")
     p.add_argument("--account", type=int, choices=(1, 2), default=1)
+    p.add_argument("--inspect", action="store_true")
     p.add_argument("--no-proxy", action="store_true")
     p.add_argument("--headed", action="store_true")
     return p.parse_args(argv)
@@ -115,6 +210,14 @@ async def main(argv=None) -> int:
     try:
         ok, line = await run_check(context, page, email, password)
         print(f"{line}  [{time.monotonic() - started:.0f}s]")
+        if ok and args.inspect:
+            print("Inspecting Talent Finder (no search, no unlock)...")
+            report = await inspect_after_login(page)
+            out = os.path.abspath(f"login-inspect-{int(time.time())}.json")
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=1, ensure_ascii=False)
+            print(json.dumps(report, indent=1, ensure_ascii=False))
+            print(f"Saved: {out}")
         if not ok:
             shot = os.path.abspath(f"login-check-{int(time.time())}.png")
             try:
