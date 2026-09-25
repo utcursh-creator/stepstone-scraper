@@ -53,7 +53,16 @@ function boot() {
     location.replace('/'); return;
   }
   if (val('tf_session') && val('tf_session') !== 'expired') {
-    document.getElementById('app').innerHTML = '<nav><a href="/talent-sourcing">Talent Finder</a></nav>'; return;
+    document.getElementById('app').innerHTML = '<nav><a href="/talent-sourcing">Talent Finder</a></nav>';
+    // Like the real app: the dashboard never loads the balance; Talent Finder
+    // does, with a header the app adds itself (a bare fetch does not carry it).
+    if (location.pathname.startsWith('/talent-sourcing')) {
+      const xhr = new XMLHttpRequest();  // the real app loads it with XHR, not fetch
+      xhr.open('GET', '/recruiter/talent-sourcing/api/v1/credits');
+      xhr.setRequestHeader('x-app-auth', 'yes');
+      xhr.send();
+    }
+    return;
   }
   setTimeout(() => { location.href = '__LOGIN_TARGET__'; }, 300);
 }
@@ -123,6 +132,8 @@ class FakeStepstone:
         self.accounts = {EMAIL: PASSWORD, OTHER_EMAIL: OTHER_PASSWORD}
         self.hits = []                  # (host, path)
         self.credits_cookies = []       # cookie header seen by the credits API
+        self.credits_mode = "cookie"    # cookie | app_only (the live site, 2026-09-25)
+        self.credits_calls = []         # (by_app, status)
 
     async def handle(self, route):
         req = route.request
@@ -134,9 +145,13 @@ class FakeStepstone:
             if self.scenario == "blocked":
                 return await route.fulfill(status=403, content_type="text/html", body=BLOCK_HTML)
             if path.startswith("/recruiter/talent-sourcing/api/v1/credits"):
-                cookie = (await req.all_headers()).get("cookie", "")
+                headers = await req.all_headers()
+                cookie = headers.get("cookie", "")
+                by_app = headers.get("x-app-auth") == "yes"
                 self.credits_cookies.append(cookie)
-                if "tf_session=session-for-" in cookie:
+                ok = "tf_session=session-for-" in cookie and (by_app or self.credits_mode == "cookie")
+                self.credits_calls.append((by_app, 200 if ok else 401))
+                if ok:
                     return await route.fulfill(status=200, content_type="application/json", body=json.dumps(CREDITS))
                 return await route.fulfill(status=401, content_type="application/json", body="{}")
             return await route.fulfill(status=200, content_type="text/html",
@@ -159,6 +174,7 @@ async def site(monkeypatch, tmp_path):
     monkeypatch.setattr(auth_mod, "SESSION_REUSE_TIMEOUT_S", 8)
     monkeypatch.setattr(auth_mod, "OUTCOME_TIMEOUT_S", 8)
     monkeypatch.setattr(auth_mod, "POLL_INTERVAL_S", 0.2)
+    monkeypatch.setattr(auth_mod, "TALENT_FINDER_NUDGE_S", 0.6)
     monkeypatch.setattr(auth_mod, "_session_path", lambda email: str(tmp_path / f"{email}.json"))
 
     async def quick(*a, **k):
@@ -204,6 +220,41 @@ async def test_fresh_login_declines_cookies_types_credentials_and_proves_itself(
     consent = {c["name"]: c["value"] for c in await context.cookies("https://recruit.stepstone.com")}
     assert consent.get("consent_level") == "essential", "non-essential cookies must be declined, never accepted"
     assert PASSWORD not in caplog.text, "the password must never reach the logs"
+
+
+async def test_login_is_proven_by_the_apps_own_balance_call_when_ours_is_refused(site):
+    """The live site, 2026-09-25: logged in fine, but a fetch() we made ourselves
+    never got the balance, and the dashboard does not load it. The proof must
+    come from the app's OWN call on Talent Finder, observed on the network."""
+    fake, context, page, _ = site
+    fake.credits_mode = "app_only"
+
+    credits = await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
+    assert ("recruit.stepstone.com", "/talent-sourcing") in fake.hits, "Talent Finder must be opened"
+    assert (True, 200) in fake.credits_calls, "the balance must come from the app's own call"
+    assert (False, 401) in fake.credits_calls, "our own fetch was refused, as on the live site"
+
+
+async def test_a_failed_proof_says_what_both_balance_routes_saw(site, monkeypatch):
+    """A proof that never arrives must not fail vaguely again: the error names
+    what the app's call and our fetch returned."""
+    fake, context, page, _ = site
+    fake.credits_mode = "app_only"
+    monkeypatch.setattr(auth_mod, "TALENT_FINDER_URL", "https://recruit.stepstone.com/nowhere")
+    monkeypatch.setattr(auth_mod, "_open_talent_finder",
+                        lambda page: _async_value("disabled in this test"))
+
+    with pytest.raises(AuthenticationError) as err:
+        await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert err.value.code == "LOGIN_OUTCOME_TIMEOUT"
+    assert "our fetch=401" in str(err.value) and "app's own call=not seen" in str(err.value)
+
+
+async def _async_value(value):
+    return value
 
 
 async def test_a_saved_session_that_still_works_is_reused_without_the_form(site):
