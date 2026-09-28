@@ -23,3 +23,27 @@ os.environ.setdefault("AIRTABLE_CREDIT_TABLE", "tbl_test_credit")
 os.environ.setdefault("N8N_WEBHOOK_URL", "https://example.test/webhook")
 os.environ.setdefault("RECRUITEE_API_TOKEN", "recruitee_test_token")
 os.environ.setdefault("RECRUITEE_COMPANY_ID", "61932")
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fresh_geocoder_state():
+    """Resolved places now outlive clear_cache() (towns do not move), and a 429
+    starts a cooldown. Both are process-wide, so every test starts clean."""
+    import utils.geocode as geocode_mod
+    geocode_mod._geo_cache.clear()
+    geocode_mod._blocked_until = 0.0
+    yield
+    geocode_mod._geo_cache.clear()
+    geocode_mod._blocked_until = 0.0
+
+
+@pytest.fixture(autouse=True)
+def _no_login_cooldown():
+    """A failed login in one test must not block logins in the next."""
+    import main as main_mod
+    main_mod._auth_blocked_until = 0.0
+    yield
+    main_mod._auth_blocked_until = 0.0

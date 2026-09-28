@@ -518,6 +518,7 @@ def _wire_main(monkeypatch, auth_behaviour):
     monkeypatch.setattr(main_mod, "close_browser", fake_close)
     monkeypatch.setattr(main_mod, "authenticate", fake_auth)
     monkeypatch.setattr(main_mod, "search_talents", fake_search)
+    monkeypatch.setattr(main_mod, "_auth_blocked_until", 0.0)
     return calls
 
 
@@ -558,3 +559,32 @@ async def test_when_every_account_fails_each_reason_is_reported(monkeypatch):
     assert calls == [EMAIL, OTHER_EMAIL]
     assert "All accounts failed to authenticate" in result.error
     assert "LOGIN_REJECTED" in result.error and "LOGIN_OUTCOME_TIMEOUT" in result.error
+
+
+async def test_after_every_account_failed_the_next_jobs_do_not_log_in_again(monkeypatch):
+    """n8n sends the next queued job right after a failed one. Without a
+    cooldown, one failed login becomes one login per queued job from rotating
+    IPs, which is how the account gets locked."""
+    calls = _wire_main(monkeypatch, {
+        EMAIL: AuthenticationError("code error", code="LOGIN_CAPTCHA"),
+        OTHER_EMAIL: None,
+    })
+
+    first = await main_mod.run_scrape(_job())
+    second = await main_mod.run_scrape(_job())
+    third = await main_mod.run_scrape(_job())
+
+    assert "All accounts failed to authenticate" in first.error
+    assert calls == [EMAIL], "no login at all for the jobs that follow"
+    for r in (second, third):
+        assert r.error.startswith("AUTH_COOLDOWN:") and r.partial is True
+        assert "All accounts failed to authenticate" not in r.error
+
+
+async def test_a_successful_login_sets_no_cooldown(monkeypatch):
+    calls = _wire_main(monkeypatch, {EMAIL: None, OTHER_EMAIL: None})
+
+    await main_mod.run_scrape(_job())
+    await main_mod.run_scrape(_job())
+
+    assert calls == [EMAIL, EMAIL]

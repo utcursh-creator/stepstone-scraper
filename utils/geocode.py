@@ -3,13 +3,28 @@
 Extracts home address and desired work locations from StepStone profile text,
 geocodes them using Nominatim, and calculates distances.
 
-Nominatim requires max 1 request/second. Results are cached for the lifetime
-of a scrape run; call clear_cache() between jobs.
+Nominatim requires max 1 request/second. Places that resolved stay cached for
+the life of the process (towns do not move); clear_cache() between jobs only
+forgets the ones that did not resolve.
+
+"No such place" and "the geocoder is not answering" are different failures and
+must never be reported as the same one. On 2026-09-28 Nominatim answered 429 to
+every request, and each job was reported as "location could not be geocoded"
+with the advice to fix a location that was fine. A refusal, timeout or outage
+is retried with a pause, then raised as GeocoderUnavailable, and after a 429 no
+further request is sent until a cooldown has passed, so a queue of jobs cannot
+keep the block alive.
 """
 import logging
 import re
 import time
 
+from geopy.exc import (
+    GeocoderRateLimited,
+    GeocoderServiceError,
+    GeocoderTimedOut,
+    GeocoderUnavailable as _GeopyUnavailable,
+)
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 
@@ -24,10 +39,23 @@ _geo_cache: dict[str, tuple[float, float] | None] = {}
 # Rate limit tracking
 _last_geocode_time: float = 0.0
 
+# Seconds. Module constants so tests can shrink them.
+RETRY_DELAYS_S = (3.0, 10.0)   # pauses before the 2nd and 3rd attempt
+MAX_RETRY_AFTER_S = 30.0       # never honour a Retry-After longer than this in-line
+RATE_LIMIT_COOLDOWN_S = 600.0  # after a 429, no request at all for this long
+
+# time.time() until which Nominatim is not asked (set by a 429).
+_blocked_until: float = 0.0
+
+
+class GeocoderUnavailable(Exception):
+    """The geocoder refused, timed out or failed. Says nothing about the place."""
+
 
 def clear_cache() -> None:
-    """Clear the geocoding cache between scrape jobs."""
-    _geo_cache.clear()
+    """Forget the places that did not resolve; keep the ones that did."""
+    for key in [k for k, v in _geo_cache.items() if v is None]:
+        del _geo_cache[key]
 
 
 # German job ads name a district as "<Gemeinde> OT <Ortsteil>" ("Wölfersheim OT
@@ -70,33 +98,55 @@ def strip_ortsteil(location: str) -> str:
 
 
 def _geocode_query(query: str) -> tuple[float, float] | None:
-    """One rate-limited Nominatim lookup. No caching — see _rate_limited_geocode.
+    """One Nominatim lookup, rate-limited and retried. No caching — see
+    _rate_limited_geocode.
+
+    Returns (lat, lon), or None when Nominatim answers that there is no such
+    place. Raises GeocoderUnavailable when it does not answer usefully (429,
+    timeout, 5xx) even after the retries.
 
     Appends ', Deutschland' to disambiguate German cities (prevents 'Halle'
     matching Belgium, 'Frankfurt' matching Frankfurt an der Oder, etc.).
     """
-    global _last_geocode_time
+    global _last_geocode_time, _blocked_until
 
-    # Rate limit: Nominatim requires max 1 request per second
-    now = time.time()
-    elapsed = now - _last_geocode_time
-    if elapsed < 1.1:
-        time.sleep(1.1 - elapsed)
+    if time.time() < _blocked_until:
+        raise GeocoderUnavailable(
+            f"Nominatim rate-limited this server; not asking again for "
+            f"{int(_blocked_until - time.time())}s"
+        )
 
-    try:
-        search_query = f"{query}, Deutschland"
-        location = _geocoder.geocode(search_query, timeout=10)
-        _last_geocode_time = time.time()
+    search_query = f"{query}, Deutschland"
+    last_error = ""
+    for attempt in range(len(RETRY_DELAYS_S) + 1):
+        # Rate limit: Nominatim requires max 1 request per second
+        elapsed = time.time() - _last_geocode_time
+        if elapsed < 1.1:
+            time.sleep(1.1 - elapsed)
+        try:
+            location = _geocoder.geocode(search_query, timeout=10)
+            _last_geocode_time = time.time()
+            if location:
+                result = (location.latitude, location.longitude)
+                logger.info(f"Geocoded '{query}' -> ({result[0]:.4f}, {result[1]:.4f})")
+                return result
+            logger.warning(f"Geocoding failed for '{query}' - no results")
+            return None
+        except GeocoderRateLimited as e:
+            _last_geocode_time = time.time()
+            last_error = f"429 rate-limited: {e}"
+            pause = min(float(e.retry_after or 0), MAX_RETRY_AFTER_S)
+        except (GeocoderTimedOut, _GeopyUnavailable, GeocoderServiceError) as e:
+            _last_geocode_time = time.time()
+            last_error = f"{type(e).__name__}: {e}"
+            pause = 0.0
+        logger.warning(f"Geocoding error for '{query}' (attempt {attempt + 1}): {last_error[:160]}")
+        if attempt < len(RETRY_DELAYS_S):
+            time.sleep(max(pause, RETRY_DELAYS_S[attempt]))
 
-        if location:
-            result = (location.latitude, location.longitude)
-            logger.info(f"Geocoded '{query}' -> ({result[0]:.4f}, {result[1]:.4f})")
-            return result
-        logger.warning(f"Geocoding failed for '{query}' - no results")
-        return None
-    except Exception as e:
-        logger.warning(f"Geocoding error for '{query}': {e}")
-        return None
+    if last_error.startswith("429"):
+        _blocked_until = time.time() + RATE_LIMIT_COOLDOWN_S
+    raise GeocoderUnavailable(f"Nominatim did not answer for {query!r}: {last_error[:200]}")
 
 
 def _rate_limited_geocode(query: str) -> tuple[float, float] | None:
@@ -104,7 +154,8 @@ def _rate_limited_geocode(query: str) -> tuple[float, float] | None:
 
     Returns (lat, lon) on success, None if neither the full string nor its
     Ortsteil-stripped form resolves. Results (including None) are cached under
-    the original query for the lifetime of the run.
+    the original query. Raises GeocoderUnavailable when the geocoder does not
+    answer; that is never cached.
 
     The fallback only fires after the full string has already failed, so a
     location that geocodes today keeps its exact coordinates.
@@ -193,7 +244,9 @@ def calculate_distance_km(
     """Calculate geodesic distance in km between two German city names.
 
     Returns the distance rounded to 1 decimal, or None if either location
-    cannot be geocoded.
+    cannot be geocoded. Raises GeocoderUnavailable when the geocoder does not
+    answer: an unknown distance must not let a candidate through the gate
+    because Nominatim had a bad minute.
     """
     candidate_coords = _rate_limited_geocode(candidate_location)
     job_coords = _rate_limited_geocode(job_location)

@@ -322,3 +322,26 @@ async def test_run_scrape_proceeds_when_job_location_geocodes(monkeypatch):
 
     assert reached_browser is True, "a geocodable job must not be aborted"
     assert result.partial is True  # from the RuntimeError above, not the pre-flight
+
+
+@pytest.mark.asyncio
+async def test_a_geocoder_outage_is_not_reported_as_a_wrong_location(monkeypatch):
+    """Prod 2026-09-28: Nominatim answered 429 to every job, and each was
+    reported as 'could not be geocoded' with the advice to fix a location that
+    was fine. An outage gets its own code, and still stops before the browser."""
+    from utils.geocode import GeocoderUnavailable
+
+    def down(loc):
+        raise GeocoderUnavailable("429 rate-limited")
+
+    async def fake_browser(*a, **k):
+        raise AssertionError("browser launched while the geocoder is down")
+
+    monkeypatch.setattr(main_mod, "geocode_location", down)
+    monkeypatch.setattr(main_mod, "create_browser", fake_browser)
+
+    result = await main_mod.run_scrape(_job("Burladingen"))
+
+    assert result.error.startswith("GEOCODER_UNAVAILABLE:")
+    assert "could not be geocoded" not in result.error, "n8n would advise fixing the location"
+    assert result.partial is True and result.candidates == []

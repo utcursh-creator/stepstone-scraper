@@ -207,3 +207,72 @@ def test_relocation_with_no_gewuenschte_arbeitsorte():
     )
     assert accepted is False
     assert reason == DIST_TOO_FAR_NO_RELOCATION
+
+
+# -- the geocoder not answering is not "no such place" (prod 2026-09-28) --
+
+import pytest
+from geopy.exc import GeocoderRateLimited, GeocoderTimedOut
+
+
+@pytest.fixture
+def fast_retries(monkeypatch):
+    monkeypatch.setattr(geocode_mod, "RETRY_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr(geocode_mod, "_blocked_until", 0.0)
+    monkeypatch.setattr(geocode_mod, "_last_geocode_time", 0.0)
+    monkeypatch.setattr(geocode_mod.time, "sleep", lambda s: None)
+    geocode_mod._geo_cache.clear()
+    yield
+    geocode_mod._geo_cache.clear()
+
+
+def _loc(lat, lon):
+    loc = MagicMock()
+    loc.latitude, loc.longitude = lat, lon
+    return loc
+
+
+def test_a_429_that_clears_on_retry_still_resolves(fast_retries):
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.side_effect = [GeocoderRateLimited("429"), _loc(48.3, 9.1)]
+        assert geocode_mod.geocode_location("Burladingen") == (48.3, 9.1)
+
+
+def test_a_geocoder_that_keeps_refusing_raises_and_is_not_cached(fast_retries):
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.side_effect = GeocoderRateLimited("429")
+        with pytest.raises(geocode_mod.GeocoderUnavailable):
+            geocode_mod.geocode_location("Burladingen")
+        assert mock_gc.geocode.call_count == 3, "three attempts, then give up"
+    assert "burladingen" not in geocode_mod._geo_cache, "an outage must not be cached as 'no such place'"
+
+
+def test_after_a_429_the_next_job_does_not_ask_again(fast_retries):
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.side_effect = GeocoderRateLimited("429")
+        with pytest.raises(geocode_mod.GeocoderUnavailable):
+            geocode_mod.geocode_location("Burladingen")
+        calls = mock_gc.geocode.call_count
+        with pytest.raises(geocode_mod.GeocoderUnavailable):
+            geocode_mod.geocode_location("Deggendorf")
+        assert mock_gc.geocode.call_count == calls, "cooldown: no request while blocked"
+
+
+def test_a_timeout_is_unavailable_not_unknown(fast_retries):
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.side_effect = GeocoderTimedOut("slow")
+        with pytest.raises(geocode_mod.GeocoderUnavailable):
+            calculate_distance_km("22589 Hamburg", "Hamburg")
+
+
+def test_resolved_places_survive_clear_cache_and_unknown_ones_do_not(fast_retries):
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.side_effect = lambda q, timeout=10: _loc(53.55, 10.0) if "Hamburg" in q else None
+        geocode_mod.geocode_location("Hamburg")
+        geocode_mod.geocode_location("Nowhere XYZ")
+        clear_cache()
+        calls = mock_gc.geocode.call_count
+        geocode_mod.geocode_location("Hamburg")
+        assert mock_gc.geocode.call_count == calls, "a town that resolved is not asked again"
+        geocode_mod.geocode_location("Nowhere XYZ")
+        assert mock_gc.geocode.call_count > calls, "an unknown place is asked again next job"

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from utils.geocode import (
     calculate_distance_km,
     check_desired_location_match,
     geocode_location,
+    GeocoderUnavailable,
     strip_ortsteil,
     should_accept_far_candidate,
     DIST_TOO_FAR_FOR_RELOCATION,
@@ -50,6 +52,20 @@ scrape_lock = asyncio.Lock()
 current_status: dict = {"state": "idle", "job": None, "error": None}
 
 COUNTER_PATH = os.path.join("state", "account_counter.json")
+
+# After every account failed to log in, no further login is attempted for this
+# long. n8n chains the next queued job straight after a failed one, so without
+# this one bad login becomes one login per queued job, from rotating proxy IPs:
+# exactly what trips StepStone's bot check and gets an account locked.
+AUTH_COOLDOWN_S = 3 * 3600
+_auth_blocked_until: float = 0.0
+_auth_block_reason: str = ""
+
+
+def _block_logins(reason: str) -> None:
+    global _auth_blocked_until, _auth_block_reason
+    _auth_blocked_until = time.time() + AUTH_COOLDOWN_S
+    _auth_block_reason = reason[:300]
 UNLOCK_COUNTER_PATH = os.path.join("state", "unlock_counter.json")
 
 # Abort a job after this many CONSECUTIVE eval errors. One timeout is transient
@@ -238,18 +254,44 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     # and each one mislabelled 'Ausland' though four lived in Germany.
     # Bail before the browser, the proxy and the first credit.
     # ================================================================
-    if geocode_location(job.location) is None:
-        # Deliberately does not assert the row is wrong: _geocode_query returns
-        # None both for "no such place" and for a transient Nominatim error
-        # (timeout / 503 / rate-limit), and this is now the first Nominatim
-        # call of the run. Name both causes so nobody edits a correct row
-        # because OSM had a bad minute. Retry-with-backoff is the real fix.
+    try:
+        job_coords = geocode_location(job.location)
+    except GeocoderUnavailable as e:
+        # The geocoder is down or refusing us: that says nothing about the
+        # location. Prod 2026-09-28: Nominatim answered 429 to every job and
+        # each one was reported as a wrong location. Distinct code, and the
+        # message never contains "could not be geocoded".
+        msg = (
+            f"GEOCODER_UNAVAILABLE: the map lookup service (OpenStreetMap Nominatim) is "
+            f"not answering, so the distance to {job.location!r} cannot be checked. "
+            f"This is temporary and not about the job's location; nothing was searched "
+            f"and no credits were spent. The job runs again on the next cycle. ({e})"
+        )
+        logger.error(msg)
+        result.partial = True
+        result.error = msg
+        current_status["error"] = msg
+        return result
+    if job_coords is None:
         msg = (
             f"Job location {job.location!r} could not be geocoded, so no candidate "
-            f"could pass the distance gate — aborting before any unlock. Either "
-            f"the location is wrong on the Airtable job row (a plain municipality "
-            f"resolves; a typo or a foreign town does not), or the geocoder was "
-            f"briefly unavailable. If the next run succeeds, it was the geocoder."
+            f"could pass the distance gate — aborting before any unlock. The map "
+            f"lookup service answered that no such place exists in Germany, so the "
+            f"Location on the job is most likely wrong (a plain municipality "
+            f"resolves; a typo or a foreign town does not)."
+        )
+        logger.error(msg)
+        result.partial = True
+        result.error = msg
+        current_status["error"] = msg
+        return result
+
+    if time.time() < _auth_blocked_until:
+        msg = (
+            f"AUTH_COOLDOWN: the last login to StepStone failed, so no login is attempted "
+            f"for another {int((_auth_blocked_until - time.time()) / 60) + 1} min (repeated "
+            f"logins get the account locked). Nothing was searched and no credits were spent. "
+            f"Last failure: {_auth_block_reason}"
         )
         logger.error(msg)
         result.partial = True
@@ -296,6 +338,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             # after one is another suspicious login, which is how accounts get
             # locked. Only a rejection of THIS account's credentials falls back.
             if e.code in NO_FALLBACK_CODES:
+                _block_logins(failures[0])
                 raise AuthenticationError(
                     "All accounts failed to authenticate (the second account was NOT tried "
                     "after this, to avoid an account lock): " + failures[0],
@@ -317,6 +360,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     if alt_error.code in NO_FALLBACK_CODES:
                         break
             if not authenticated:
+                _block_logins(" | ".join(failures))
                 raise AuthenticationError(
                     "All accounts failed to authenticate: " + " | ".join(failures),
                     code="AUTH_FAILED",
@@ -821,6 +865,14 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         # payload, where n8n's aborted branch can see it. current_status is only
         # visible on /status, which nothing polls. Keep an earlier, more precise
         # abort reason (e.g. the eval-error threshold) if one was already set.
+        if not result.error and isinstance(e, GeocoderUnavailable):
+            # Mid-run: a candidate's distance could not be checked. Stopped
+            # rather than unlocking someone whose distance is unknown.
+            result.error = (
+                f"GEOCODER_UNAVAILABLE: the map lookup service stopped answering during "
+                f"the run, so it was stopped before unlocking anyone whose distance could "
+                f"not be checked. Temporary; credits already spent are recorded. ({e})"
+            )
         if not result.error:
             result.error = f"Scrape crashed: {type(e).__name__}: {e}"
         current_status["error"] = str(e)
