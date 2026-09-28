@@ -97,6 +97,16 @@ def strip_ortsteil(location: str) -> str:
     return stripped or location
 
 
+# German postcodes are sometimes written with a country prefix: "D-82205
+# Gilching", "DE-82205 Gilching". Nominatim finds nothing for those, and a home
+# town that cannot be placed is rejected before the unlock (live 2026-09-28).
+_COUNTRY_PREFIX_RE = re.compile(r"^\s*(?:DE|D)\s*[-\u2010-\u2013]\s*(?=\d)", re.IGNORECASE)
+
+
+def _strip_country_prefix(query: str) -> str:
+    return _COUNTRY_PREFIX_RE.sub("", query)
+
+
 def _geocode_query(query: str) -> tuple[float, float] | None:
     """One Nominatim lookup, rate-limited and retried. No caching — see
     _rate_limited_geocode.
@@ -116,7 +126,7 @@ def _geocode_query(query: str) -> tuple[float, float] | None:
             f"{int(_blocked_until - time.time())}s"
         )
 
-    search_query = f"{query}, Deutschland"
+    search_query = f"{_strip_country_prefix(query)}, Deutschland"
     last_error = ""
     for attempt in range(len(RETRY_DELAYS_S) + 1):
         # Rate limit: Nominatim requires max 1 request per second
@@ -206,7 +216,9 @@ def extract_wohnadresse(profile_text: str | None) -> str | None:
         return None
 
     # Pattern 1: postal code (5 digits) + city name
-    match = re.search(r"Wohnadresse\s+(\d{5}\s+[^\n]+)", profile_text)
+    # An optional country prefix ("Wohnadresse D-82205 Gilching") must not
+    # leave "D-" as the address after a paid unlock.
+    match = re.search(r"Wohnadresse\s+(?:DE?\s*-\s*)?([0-9]{5}\s+[^\n]+)", profile_text)
     if match:
         return match.group(1).strip()
 

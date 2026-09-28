@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -268,8 +269,23 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     # and each one mislabelled 'Ausland' though four lived in Germany.
     # Bail before the browser, the proxy and the first credit.
     # ================================================================
+    # Distances are measured from the job's POSTCODE when n8n sends it: a town
+    # name alone is ambiguous. Live 2026-09-28: "Neuried" resolved to Neuried in
+    # Baden while the job (82061) and StepStone's search were Neuried near Munich,
+    # so every candidate was rejected as ~270 km away. The other way round, a
+    # wrong town could ACCEPT far-away candidates and spend credits on them.
+    location_has_postcode = re.search(r"\b[0-9]{5}\b", job.location or "")
+    job_geo = (f"{job.postal_code} {job.location}" if job.postal_code and not location_has_postcode
+               else job.location)
     try:
-        job_coords = geocode_location(job.location)
+        job_coords = geocode_location(job_geo)
+        if job_coords is None and job_geo != job.location:
+            # Postcode and town disagree (or the pair is unknown): the town alone
+            # worked before postcodes existed. Every later distance must use the
+            # same string the pre-flight proved (the "Ausland" inference relies on it).
+            logger.warning(f"{job_geo!r} did not resolve; using {job.location!r}")
+            job_geo = job.location
+            job_coords = geocode_location(job_geo)
     except GeocoderUnavailable as e:
         # The geocoder is down or refusing us: that says nothing about the
         # location. Prod 2026-09-28: Nominatim answered 429 to every job and
@@ -288,7 +304,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         return result
     if job_coords is None:
         msg = (
-            f"Job location {job.location!r} could not be geocoded, so no candidate "
+            f"Job location {job_geo!r} could not be geocoded, so no candidate "
             f"could pass the distance gate — aborting before any unlock. The map "
             f"lookup service answered that no such place exists in Germany, so the "
             f"Location on the job is most likely wrong (a plain municipality "
@@ -503,7 +519,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             distance_km = None
 
             if wohnort:
-                distance_km = calculate_distance_km(wohnort, job.location)
+                distance_km = calculate_distance_km(wohnort, job_geo)
                 logger.info(
                     f"  Card-level distance for {candidate.profile_id}: "
                     f"Wohnort={wohnort}, distance={distance_km}km"
@@ -778,7 +794,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     post_unlock_addr = extract_wohnadresse(profile.profile_text) if profile.profile_text else None
                     if post_unlock_addr:
                         try:
-                            distance_km = calculate_distance_km(post_unlock_addr, job.location)
+                            distance_km = calculate_distance_km(post_unlock_addr, job_geo)
                         except GeocoderUnavailable:
                             # The credit is spent: keep the profile and let the
                             # fail-closed gate below handle it, never lose it.

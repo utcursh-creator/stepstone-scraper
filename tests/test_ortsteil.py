@@ -345,3 +345,38 @@ async def test_a_geocoder_outage_is_not_reported_as_a_wrong_location(monkeypatch
     assert result.error.startswith("GEOCODER_UNAVAILABLE:")
     assert "could not be geocoded" not in result.error, "n8n would advise fixing the location"
     assert result.partial is True and result.candidates == []
+
+
+@pytest.mark.asyncio
+async def test_the_job_is_placed_by_its_postcode_not_just_its_town_name(monkeypatch):
+    """Live 2026-09-28: 'Neuried' resolved to Neuried in Baden, while the job
+    (82061) and StepStone's search were Neuried near Munich: every candidate was
+    rejected as ~270 km away. The postcode makes the town unambiguous."""
+    asked = []
+
+    def geocode(loc):
+        asked.append(loc)
+        return None  # stop the job right after the pre-flight
+
+    monkeypatch.setattr(main_mod, "geocode_location", geocode)
+    job = _job("Neuried")
+    job.postal_code = "82061"
+
+    await main_mod.run_scrape(job)
+
+    assert asked[0] == "82061 Neuried", "the postcode is tried first"
+
+
+@pytest.mark.asyncio
+async def test_a_postcode_that_does_not_resolve_falls_back_to_the_town(monkeypatch):
+    asked = []
+
+    def geocode(loc):
+        asked.append(loc)
+        return None
+
+    monkeypatch.setattr(main_mod, "geocode_location", geocode)
+    job = _job("Neuried")
+    job.postal_code = "99999"
+    await main_mod.run_scrape(job)
+    assert asked == ["99999 Neuried", "Neuried"]

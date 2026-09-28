@@ -34,6 +34,18 @@ class JobInput(BaseModel):
     # _normalize_keywords — so unexpected n8n output cannot crash the job.
     keywords: list[str] = []
     account: str | None = None  # Optional: email, "Account N", or "N" — n8n decides which account has credits
+    # The job's German postcode (from the Recruitee offer), used to place the job
+    # for distance checks: town names repeat (Neuried, Walldorf, ...).
+    postal_code: str = ""
+
+    @field_validator("postal_code", mode="before")
+    @classmethod
+    def _parse_postal_code(cls, v):
+        """A German 5-digit postcode, or "" (then the town name is used)."""
+        if isinstance(v, int) and not isinstance(v, bool):
+            v = f"{v:05d}"  # 01067 sent as a number arrives as 1067
+        m = re.search(r"\b[0-9]{5}\b", str(v or ""))
+        return m.group() if m else ""
 
     @field_validator("max_distance_km", mode="before")
     @classmethod

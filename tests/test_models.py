@@ -298,3 +298,10 @@ def test_jobinput_keywords_drops_the_linkedin_selector_tag():
     job = JobInput(offer_id="1", stage_id="2", job_title="SAP Consultant", location="Hamburg",
                    keywords="Archivierung, LIsourcing")
     assert job.keywords == ["Archivierung"]
+
+
+def test_jobinput_postal_code_never_fails_and_keeps_leading_zeros():
+    for raw, want in ((1067, "01067"), ("01067", "01067"), ("D-82061", "82061"), ("82061 Neuried", "82061"),
+                      (None, ""), ("keine Angabe", ""), (True, "")):
+        job = JobInput(offer_id="1", stage_id="2", job_title="X", location="Y", postal_code=raw)
+        assert job.postal_code == want, raw

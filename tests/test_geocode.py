@@ -276,3 +276,16 @@ def test_resolved_places_survive_clear_cache_and_unknown_ones_do_not(fast_retrie
         assert mock_gc.geocode.call_count == calls, "a town that resolved is not asked again"
         geocode_mod.geocode_location("Nowhere XYZ")
         assert mock_gc.geocode.call_count > calls, "an unknown place is asked again next job"
+
+
+def test_a_d_prefixed_postcode_is_looked_up_without_the_prefix(fast_retries):
+    """Live 2026-09-28: 'D-82205 Gilching' found nothing, so a candidate from a
+    real German town was rejected as not locatable."""
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.return_value = _loc(48.1, 11.3)
+        assert geocode_mod.geocode_location("D-82205 Gilching") == (48.1, 11.3)
+        assert mock_gc.geocode.call_args[0][0] == "82205 Gilching, Deutschland"
+
+
+def test_a_d_prefixed_home_address_is_read_whole_after_an_unlock():
+    assert extract_wohnadresse("Wohnadresse D-82205 Gilching\n") == "82205 Gilching"
