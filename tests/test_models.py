@@ -290,3 +290,11 @@ def test_skipped_pre_unlock_counter_serialized_in_webhook_payload():
     result.candidates_skipped_pre_unlock += 5
     payload = result.model_dump()
     assert payload["candidates_skipped_pre_unlock"] == 5
+
+
+def test_jobinput_keywords_drops_the_linkedin_selector_tag():
+    # Live Jobs rows (2026-09-28) carry "Archivierung, LIsourcing": the second is
+    # the LinkedIn flow's selector, not a skill, and would empty the search.
+    job = JobInput(offer_id="1", stage_id="2", job_title="SAP Consultant", location="Hamburg",
+                   keywords="Archivierung, LIsourcing")
+    assert job.keywords == ["Archivierung"]

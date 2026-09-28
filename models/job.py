@@ -4,9 +4,11 @@ from pydantic import BaseModel, ConfigDict, Field, AliasChoices, field_validator
 
 
 # Recruitee tags that are NOT search keywords even though they carry a hashtag.
-# The selector tag marks a job for the automation; radius tags set the distance.
-# Both must be dropped if they leak into the keywords list.
-_SELECTOR_TAGS = {"bensourcing"}
+# Selector tags mark a job for an automation (#BenSourcing: this scraper;
+# #LIsourcing: the LinkedIn sourcing flow); radius tags set the distance. All
+# must be dropped if they leak into the keywords list: ANDed into the StepStone
+# search, "LIsourcing" matches nobody (seen on the live Jobs table 2026-09-28).
+_SELECTOR_TAGS = {"bensourcing", "lisourcing"}
 _RADIUS_TOKEN_RE = re.compile(r"^\d+\s*km$", re.IGNORECASE)
 _FIRST_INT_RE = re.compile(r"\d+")
 
