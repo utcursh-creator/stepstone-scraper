@@ -41,7 +41,16 @@ async def create_browser(
     )
 
     composed_pass = proxy_password(proxy_pass, proxy_country, sticky_key)
+    browser._stepstone_driver = p
+    try:
+        context, page = await _open_context(browser, proxy_host, proxy_port, proxy_user, composed_pass)
+    except Exception:
+        await close_browser(browser)
+        raise
+    return browser, context, page
 
+
+async def _open_context(browser, proxy_host, proxy_port, proxy_user, composed_pass):
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
         locale="de-DE",
@@ -55,15 +64,12 @@ async def create_browser(
 
     page = await context.new_page()
     page.set_default_navigation_timeout(120_000)
-
-    # close_browser stops the driver too; left running, each job leaked one
-    # Playwright node process (13 per full run).
-    browser._stepstone_driver = p
-    return browser, context, page
+    return context, page
 
 
 async def close_browser(browser: Browser) -> None:
-    """Safely close the browser."""
+    """Safely close the browser, then stop its Playwright driver (left running,
+    each job leaked one node process: 13 per full run)."""
     try:
         await browser.close()
     except Exception:

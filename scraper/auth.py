@@ -176,9 +176,13 @@ def save_session(email: str, cookies: list[dict]) -> None:
 
 
 def _save_session(path: str, cookies: list[dict]) -> None:
+    # Atomic: a redeploy (SIGTERM) mid-write must not leave half a file, which
+    # would read as "no session" and cost a password login.
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(cookies, f)
+    os.replace(tmp, path)
 
 
 # ------------------------------------------------------------------ helpers
@@ -571,6 +575,17 @@ async def _authenticate(context: BrowserContext, page: Page, proof: _SessionProo
     if saved_cookies:
         try:
             await context.add_cookies(saved_cookies)
+        except Exception as e:
+            # The saved file itself is unusable, and would be on every job:
+            # discard it. With no usable session, a password login is right.
+            logger.warning(f"Saved session file for {email} is unusable ({type(e).__name__}); discarding it")
+            try:
+                os.remove(session_file)
+            except OSError:
+                pass
+            saved_cookies = None
+    if saved_cookies:
+        try:
             await page.goto(APP_URL, wait_until="domcontentloaded")
             state, credits = await _await_landing(page, proof, SESSION_REUSE_TIMEOUT_S)
         except Exception as e:

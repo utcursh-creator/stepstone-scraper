@@ -131,6 +131,8 @@ async def _unlocked_by_us_recently(page: Page, talent_id: str) -> bool | None:
             when = datetime.fromisoformat(str(action.get("actionDate")).replace("Z", "+00:00"))
         except ValueError:
             when = None
+        if when is not None and when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
         if action.get("isCurrentUser") and when and now - when <= RECENT_UNLOCK:
             return True
     return False
@@ -193,6 +195,15 @@ async def unlock_talent(page: Page, candidate: SearchResult, account_label: str,
     if status == 401:
         raise UnlockError("StepStone answered 401 to the unlock; the session is no longer valid",
                           code="UNLOCK_SESSION_LOST")
+    if status in (404, 410):
+        # This one talent is gone (profile deleted between search and unlock):
+        # skip them. Two such in a row still stop the job (main.py).
+        charged = await _unlocked_by_us_recently(page, talent_id)
+        logger.warning(f"Unlock of {talent_id}: HTTP {status}, talent no longer available; charged={charged}")
+        return None, charged is not False
+    if status == 429:
+        raise UnlockError("StepStone rate-limited the unlocks (HTTP 429)", code="UNLOCK_RATE_LIMITED",
+                          credit_spent=(await _unlocked_by_us_recently(page, talent_id)) is not False)
     if isinstance(status, int) and 400 <= status < 500:
         # StepStone refused the request itself (wrong shape, gone, forbidden).
         # It will refuse every further unlock the same way: stop the job instead

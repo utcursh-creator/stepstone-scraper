@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from models.candidate import CandidateResult, ScrapeResult
 from models.config import Settings
 from models.job import JobInput
-from scraper.auth import NO_FALLBACK_CODES, AuthenticationError, authenticate, save_session
+from scraper.auth import AuthenticationError, authenticate, save_session
 from scraper.browser import close_browser, create_browser
 from scraper.dedup import check_duplicate
 from scraper.talent_unlock import UnlockError, unlock_talent
@@ -66,6 +66,10 @@ AUTH_COOLDOWN_S = 3 * 3600
 JOB_SOFT_LIMIT_S = 45 * 60
 JOB_HARD_LIMIT_S = 60 * 60
 MAX_CONSECUTIVE_UNLOCK_FAILURES = 2
+
+# The running job's result, so a job killed by the hard limit still reports
+# what it already did. One job at a time (scrape_lock).
+_current_result = None
 _auth_blocked_until: float = 0.0
 _auth_block_reason: str = ""
 
@@ -242,6 +246,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     account = select_account(accounts, job.account, COUNTER_PATH)
     account_label = f"Account {accounts.index(account) + 1}"
 
+    global _current_result
     result = ScrapeResult(
         offer_id=job.offer_id,
         stage_id=job.stage_id,
@@ -250,6 +255,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         requirements=job.requirements,
         account_used=account_label,
     )
+    _current_result = result  # locked_scrape reports it if the job must be killed
 
     # ================================================================
     # PRE-FLIGHT: the job's own location must be geocodable.
@@ -670,6 +676,15 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 # Stop, and say why. A credit it may have taken is still charged.
                 if e.credit_spent:
                     unlock_budget.record_unlock(UNLOCK_COUNTER_PATH, today)
+                    # n8n's Credit Ledger is built from unlocked candidates with
+                    # credit_spent: report the charge, even without details.
+                    result.candidates.append(CandidateResult(
+                        name="", stepstone_profile_id=candidate.profile_id, matched=True,
+                        match_confidence=eval_result.confidence,
+                        match_reasoning=f"Freischaltung abgelehnt ({e.code}); Credit von StepStone womöglich belastet.",
+                        unlocked=True, unlock_reason="unlock_rejected", credit_spent=True,
+                        account_used=account_label,
+                    ))
                 logger.error(f"Stopping the job: {e}")
                 result.partial = True
                 result.error = str(e)
@@ -762,7 +777,12 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                 if distance_km is None:
                     post_unlock_addr = extract_wohnadresse(profile.profile_text) if profile.profile_text else None
                     if post_unlock_addr:
-                        distance_km = calculate_distance_km(post_unlock_addr, job.location)
+                        try:
+                            distance_km = calculate_distance_km(post_unlock_addr, job.location)
+                        except GeocoderUnavailable:
+                            # The credit is spent: keep the profile and let the
+                            # fail-closed gate below handle it, never lose it.
+                            distance_km = None
                         logger.info(
                             f"  Post-unlock distance for {candidate.profile_id}: "
                             f"Wohnadresse={post_unlock_addr}, distance={distance_km}km"
@@ -922,8 +942,11 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                         matched=True,
                         match_confidence=eval_result.confidence,
                         match_reasoning=eval_result.reasoning,
-                        unlocked=False,
+                        # Charged but no details: still "unlocked" for n8n, so
+                        # the credit lands in the Credit Ledger and the counts.
+                        unlocked=bool(credit_spent),
                         unlock_reason="profile_extraction_failed",
+                        credit_spent=bool(credit_spent),
                         account_used=account_label,
                     )
                 )
@@ -969,11 +992,14 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             # Cookies rotate during a job; the next job must start from the
             # newest ones, or it may find the session dead and type the password.
             try:
-                save_session(authenticated_email, await context.cookies())
+                save_session(authenticated_email, await asyncio.wait_for(context.cookies(), 20))
             except Exception as e:
                 logger.warning(f"Could not save the session after the job: {type(e).__name__}")
         if browser:
-            await close_browser(browser)
+            try:
+                await asyncio.wait_for(close_browser(browser), 30)
+            except Exception as e:
+                logger.warning(f"Closing the browser did not finish: {type(e).__name__}")
 
     return result
 
@@ -984,7 +1010,9 @@ async def scrape(job: JobInput, background_tasks: BackgroundTasks):
         raise HTTPException(409, detail="Scrape already in progress")
 
     async def locked_scrape():
+        global _current_result
         async with scrape_lock:
+            _current_result = None
             try:
                 result = await asyncio.wait_for(run_scrape(job), timeout=JOB_HARD_LIMIT_S)
             except Exception as e:
@@ -994,11 +1022,14 @@ async def scrape(job: JobInput, background_tasks: BackgroundTasks):
                 reason = ("JOB_HARD_TIMEOUT: the job hung and was stopped after "
                           f"{JOB_HARD_LIMIT_S // 60} min" if isinstance(e, asyncio.TimeoutError)
                           else f"Scrape crashed: {type(e).__name__}: {e}")
-                result = ScrapeResult(
+                # Keep what the job already did (unlocks, Recruitee pushes): n8n
+                # must log those credits and candidates even when the job is killed.
+                result = _current_result or ScrapeResult(
                     offer_id=job.offer_id, stage_id=job.stage_id, job_title=job.job_title,
                     location=job.location, requirements=job.requirements, account_used="",
-                    partial=True, error=reason,
                 )
+                result.partial = True
+                result.error = reason
         # Lock released here — n8n's chain-dispatch will now get 202, not 409.
         current_status["state"] = "idle"
         current_status["job"] = None
