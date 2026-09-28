@@ -42,6 +42,7 @@ from urllib.parse import urlparse
 
 from patchright.async_api import BrowserContext, Page
 
+from utils.datadir import SESSIONS_DIR
 from utils.delays import human_delay
 
 logger = logging.getLogger(__name__)
@@ -150,7 +151,7 @@ class AuthenticationError(Exception):
 
 def _session_path(email: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9]", "_", email)
-    return os.path.join("sessions", f"{safe}.json")
+    return os.path.join(SESSIONS_DIR, f"{safe}.json")
 
 
 def _load_session(path: str) -> list[dict] | None:

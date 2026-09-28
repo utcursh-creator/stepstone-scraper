@@ -315,6 +315,7 @@ async def main(argv=None) -> int:
             proxy_user=_env("PROXY_USER"),
             proxy_pass=_env("PROXY_PASS"),
             proxy_country=_env("PROXY_COUNTRY", "DE"),
+            sticky_key=email,
         )
 
     # Show every step on the REAL site: the login module's own log lines (cookie

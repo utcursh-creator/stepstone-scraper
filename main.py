@@ -19,6 +19,7 @@ from scraper.talent_unlock import UnlockError, unlock_talent
 from scraper.rotation import select_account
 from scraper.talent_search import SearchError, search_talents
 from utils.delays import human_delay
+from utils.datadir import SESSIONS_DIR, STATE_DIR
 from utils.geocode import (
     clear_cache,
     extract_wohnadresse,
@@ -51,7 +52,7 @@ settings = Settings()
 scrape_lock = asyncio.Lock()
 current_status: dict = {"state": "idle", "job": None, "error": None}
 
-COUNTER_PATH = os.path.join("state", "account_counter.json")
+COUNTER_PATH = os.path.join(STATE_DIR, "account_counter.json")
 
 # After every account failed to log in, no further login is attempted for this
 # long. n8n chains the next queued job straight after a failed one, so without
@@ -66,7 +67,7 @@ def _block_logins(reason: str) -> None:
     global _auth_blocked_until, _auth_block_reason
     _auth_blocked_until = time.time() + AUTH_COOLDOWN_S
     _auth_block_reason = reason[:300]
-UNLOCK_COUNTER_PATH = os.path.join("state", "unlock_counter.json")
+UNLOCK_COUNTER_PATH = os.path.join(STATE_DIR, "unlock_counter.json")
 
 # Abort a job after this many CONSECUTIVE eval errors. One timeout is transient
 # and just skips a candidate; a run of them means the evaluator is systemically
@@ -79,8 +80,8 @@ EVAL_ERROR_ABORT_THRESHOLD = 3
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    os.makedirs("sessions", exist_ok=True)
-    os.makedirs("state", exist_ok=True)
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs("screenshots", exist_ok=True)
     yield
 
@@ -318,6 +319,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             proxy_user=settings.proxy_user,
             proxy_pass=settings.proxy_pass,
             proxy_country=settings.proxy_country,
+            sticky_key=account["email"],
         )
 
         # 2. Authenticate
