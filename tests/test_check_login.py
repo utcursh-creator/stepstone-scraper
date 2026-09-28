@@ -58,7 +58,7 @@ async def test_inspection_reports_the_apps_headers_our_requests_and_the_form(sit
     app = [c for c in report["app_api_calls"] if c["path"].endswith("/credits")]
     assert app and "x-app-auth" in app[0]["header_names"] and app[0]["via"] == "xhr"
     assert report["our_balance_request_from_isolated_world"] == "401"
-    assert report["our_balance_request_from_page_world"] == "401"
+    assert report["our_balance_request_from_page_world"] == "200", "the main world carries the app's session"
     assert any(n.startswith("tf_session") for n in report["app_host_cookie_names"])
     assert "yes" not in str(report["app_api_calls"]), "header VALUES must never be reported"
     placeholders = [i["placeholder"] for i in report["search_form"]["inputs"]]

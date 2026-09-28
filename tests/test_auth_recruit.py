@@ -54,7 +54,15 @@ function boot() {
     location.replace('/'); return;
   }
   if (val('tf_session') && val('tf_session') !== 'expired') {
+    // Like the real app: its own fetch carries its auth header. Only code in
+    // the page's MAIN world goes through this wrapper.
+    const origFetch = window.fetch;
+    window.fetch = (u, init = {}) => origFetch(u, { ...init, headers: { ...(init.headers || {}), 'x-app-auth': 'yes' } });
     document.getElementById('app').innerHTML = '<nav><a href="/talent-sourcing">Talent Finder</a></nav>';
+    if (__TF_BROKEN__ && location.pathname.startsWith('/talent-sourcing')) {
+      document.getElementById('app').innerHTML += '<p>Oh nein, wir können diese Seite gerade nicht laden.</p>';
+      return;
+    }
     // Like the real app: the dashboard never loads the balance; Talent Finder
     // does, with a header the app adds itself (a bare fetch does not carry it).
     if (location.pathname.startsWith('/talent-sourcing')) {
@@ -149,11 +157,12 @@ class FakeStepstone:
         self.accounts = {EMAIL: PASSWORD, OTHER_EMAIL: OTHER_PASSWORD}
         self.hits = []                  # (host, path)
         self.credits_cookies = []       # cookie header seen by the credits API
-        self.credits_mode = "cookie"    # cookie | app_only (the live site, 2026-09-25)
+        self.credits_mode = "cookie"    # cookie | app_only (the live site) | refused (never answers)
         self.credits_calls = []         # (by_app, status)
         self.redirect_delay_ms = 300    # unauthenticated app -> login page
         self.login_render_delay_ms = 0  # login page loaded -> its form shows
         self.login_blank_loads = 0      # this many login page loads never show the form
+        self.tf_broken = False          # Talent Finder shows its error page, never loads the balance
         self.search_requests = []
         self.search_total = 27
         self.remaining = CREDITS["remainingCredits"]
@@ -208,7 +217,8 @@ class FakeStepstone:
                 cookie = headers.get("cookie", "")
                 by_app = headers.get("x-app-auth") == "yes"
                 self.credits_cookies.append(cookie)
-                ok = "tf_session=session-for-" in cookie and (by_app or self.credits_mode == "cookie")
+                ok = ("tf_session=session-for-" in cookie and self.credits_mode != "refused"
+                      and (by_app or self.credits_mode == "cookie"))
                 self.credits_calls.append((by_app, 200 if ok else 401))
                 if ok:
                     return await route.fulfill(status=200, content_type="application/json",
@@ -216,6 +226,7 @@ class FakeStepstone:
                 return await route.fulfill(status=401, content_type="application/json", body="{}")
             return await route.fulfill(status=200, content_type="text/html",
                                        body=APP_HTML.replace("__LOGIN_TARGET__", self.login_target)
+                                       .replace("__TF_BROKEN__", "true" if self.tf_broken else "false")
                                        .replace("__REDIRECT_DELAY_MS__", str(self.redirect_delay_ms)))
         if host in ("login.recruit.stepstone.com", "login.stepstone-security.test"):
             blank = self.login_blank_loads > 0
@@ -288,27 +299,26 @@ async def test_fresh_login_declines_cookies_types_credentials_and_proves_itself(
     assert PASSWORD not in caplog.text, "the password must never reach the logs"
 
 
-async def test_login_is_proven_by_the_apps_own_balance_call_when_ours_is_refused(site):
-    """The live site, 2026-09-25: logged in fine, but a fetch() we made ourselves
-    never got the balance, and the dashboard does not load it. The proof must
-    come from the app's OWN call on Talent Finder, observed on the network."""
+async def test_login_is_proven_only_by_a_request_carrying_the_apps_session(site):
+    """The live site, 2026-09-25: a bare fetch() (patchright's isolated world)
+    never got the balance. Only requests that go through the app's own fetch,
+    which adds its session, are answered: the app's call on Talent Finder, or
+    ours made from the page's main world."""
     fake, context, page, _ = site
     fake.credits_mode = "app_only"
 
     credits = await authenticate(context, page, EMAIL, PASSWORD)
 
     assert credits["remainingCredits"] == 147
-    assert ("recruit.stepstone.com", "/talent-sourcing") in fake.hits, "Talent Finder must be opened"
-    assert (True, 200) in fake.credits_calls, "the balance must come from the app's own call"
-    assert (False, 401) in fake.credits_calls, "our own fetch was refused, as on the live site"
+    assert (True, 200) in fake.credits_calls, "the balance came with the app's own session header"
+    assert (False, 200) not in fake.credits_calls, "nothing proves a login without the app's session"
 
 
 async def test_a_slow_redirect_before_login_does_not_detour_through_talent_finder(site):
     """Live, 2026-09-25: the redirect to the login page was slow, so Talent
     Finder was opened BEFORE logging in. With the cookie jar just cleared that
     visit can only bounce back to the login page, and on the third live check
-    the detour cost the login page its time budget. After the login, Talent
-    Finder must still be opened (the dashboard never loads the balance)."""
+    the detour cost the login page its time budget."""
     fake, context, page, _ = site
     fake.credits_mode = "app_only"
     fake.redirect_delay_ms = 1500   # slower than the 0.6s nudge
@@ -318,7 +328,6 @@ async def test_a_slow_redirect_before_login_does_not_detour_through_talent_finde
     assert credits["remainingCredits"] == 147
     tf_visits = [i for i, h in enumerate(fake.hits) if h == ("recruit.stepstone.com", "/talent-sourcing")]
     first_login = fake.hits.index(fake.login_page_hits()[0])
-    assert tf_visits, "Talent Finder must be opened after the login, for the balance"
     assert all(i > first_login for i in tf_visits), "no Talent Finder visit before the login page"
 
 
@@ -363,7 +372,7 @@ async def test_a_failed_proof_says_what_both_balance_routes_saw(site, monkeypatc
     """A proof that never arrives must not fail vaguely again: the error names
     what the app's call and our fetch returned."""
     fake, context, page, _ = site
-    fake.credits_mode = "app_only"
+    fake.credits_mode = "refused"
     monkeypatch.setattr(auth_mod, "TALENT_FINDER_URL", "https://recruit.stepstone.com/nowhere")
     monkeypatch.setattr(auth_mod, "_open_talent_finder",
                         lambda page: _async_value("disabled in this test"))
@@ -373,6 +382,20 @@ async def test_a_failed_proof_says_what_both_balance_routes_saw(site, monkeypatc
 
     assert err.value.code == "LOGIN_OUTCOME_TIMEOUT"
     assert "our fetch=401" in str(err.value) and "app's own call=not seen" in str(err.value)
+
+
+async def test_login_is_proven_when_talent_finder_fails_to_load(site):
+    """Live, 2026-09-28 through the proxy: logged in (the header showed the
+    account holder), but Talent Finder showed "Oh nein, wir können..." and
+    never loaded the balance. Our own credits request from the page's main
+    world carries the app's session and proves the login anyway."""
+    fake, context, page, _ = site
+    fake.credits_mode = "app_only"
+    fake.tf_broken = True
+
+    credits = await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
 
 
 async def _async_value(value):

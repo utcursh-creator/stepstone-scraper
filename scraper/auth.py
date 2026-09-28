@@ -219,7 +219,10 @@ def _on_app(url: str) -> bool:
 async def _fetch_credits(page: Page) -> tuple[dict | None, str]:
     """Our own request for the balance. Returns (balance or None, what we saw)."""
     try:
-        res = await page.evaluate(_CREDITS_JS, CREDITS_PATH)
+        # The page's MAIN world, where the app's own fetch carries its session
+        # token. From patchright's default isolated world the same request gets
+        # 401 (live, 2026-09-25 and 2026-09-28); the search already works this way.
+        res = await page.evaluate(_CREDITS_JS, CREDITS_PATH, isolated_context=False)
     except Exception as e:
         return None, f"evaluate failed ({type(e).__name__})"
     if not isinstance(res, dict):
