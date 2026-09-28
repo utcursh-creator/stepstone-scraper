@@ -97,6 +97,8 @@ def strip_ortsteil(location: str) -> str:
     return stripped or location
 
 
+_GERMANY = {"DE", "DEU", "GERMANY", "DEUTSCHLAND"}
+
 # German postcodes are sometimes written with a country prefix: "D-82205
 # Gilching", "DE-82205 Gilching". Nominatim finds nothing for those, and a home
 # town that cannot be placed is rejected before the unlock (live 2026-09-28).
@@ -183,6 +185,20 @@ def _rate_limited_geocode(query: str) -> tuple[float, float] | None:
                 f"Retrying geocode for {query!r} without its Ortsteil suffix -> {base!r}"
             )
             result = _geocode_query(base)
+
+    if result is None:
+        # "82205 Gilching Ost", "65205 Wiesbaden Delkenheim", "04827
+        # Gerichshain": real German addresses whose postcode + district
+        # Nominatim cannot match as a pair (live 2026-09-28, rejected as "not
+        # locatable"). The postcode alone places them to within a few km.
+        # Never for a foreign address ("75001 Paris, FR"): its postcode would be
+        # read as a German one and place the candidate somewhere in Germany.
+        country = re.search(r",\s*([^,]+?)\s*$", query)
+        foreign = bool(country) and country.group(1).upper() not in _GERMANY
+        postcode = None if foreign else re.search(r"\b[0-9]{5}\b", _strip_country_prefix(query))
+        if postcode and postcode.group() != query.strip():
+            logger.info(f"Retrying geocode for {query!r} by its postcode alone")
+            result = _geocode_query(postcode.group())
 
     _geo_cache[cache_key] = result
     return result

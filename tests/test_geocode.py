@@ -289,3 +289,27 @@ def test_a_d_prefixed_postcode_is_looked_up_without_the_prefix(fast_retries):
 
 def test_a_d_prefixed_home_address_is_read_whole_after_an_unlock():
     assert extract_wohnadresse("Wohnadresse D-82205 Gilching\n") == "82205 Gilching"
+
+
+def test_an_address_with_a_district_falls_back_to_its_postcode(fast_retries):
+    """Live 2026-09-28: '65205 Wiesbaden Delkenheim' found nothing, and a real
+    German candidate was rejected as not locatable."""
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.side_effect = lambda q, timeout=10: _loc(50.05, 8.37) if q == "65205, Deutschland" else None
+        assert geocode_mod.geocode_location("65205 Wiesbaden Delkenheim") == (50.05, 8.37)
+
+
+def test_a_town_without_a_postcode_gets_no_postcode_fallback(fast_retries):
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.return_value = None
+        assert geocode_mod.geocode_location("Nowhere XYZ") is None
+        assert mock_gc.geocode.call_count == 1
+
+
+def test_a_foreign_address_never_falls_back_to_a_german_postcode(fast_retries):
+    """'75001 Paris, FR' must not be placed at a German 75001: that could put a
+    candidate from abroad inside the radius and spend a credit on them."""
+    with patch.object(geocode_mod, "_geocoder") as mock_gc:
+        mock_gc.geocode.return_value = None
+        assert geocode_mod.geocode_location("75001 Paris, FR") is None
+        assert all("75001, Deutschland" != c.args[0] for c in mock_gc.geocode.call_args_list)
