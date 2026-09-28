@@ -85,11 +85,14 @@ async ({ url, timeoutMs, maxBytes }) => {
 
 
 class UnlockError(Exception):
-    """A reason to STOP the job (no credits, session gone). `code` routes it."""
+    """A reason to STOP the job (no credits, session gone, unlock refused).
+    `code` routes it. `credit_spent`: StepStone may have charged for the failed
+    attempt (unverifiable counts as spent), so the caller still records it."""
 
-    def __init__(self, message: str, code: str):
+    def __init__(self, message: str, code: str, credit_spent: bool = False):
         super().__init__(f"{code}: {message}")
         self.code = code
+        self.credit_spent = credit_spent
 
 
 async def _json(page: Page, url: str, method: str = "GET", body=None,
@@ -190,6 +193,17 @@ async def unlock_talent(page: Page, candidate: SearchResult, account_label: str,
     if status == 401:
         raise UnlockError("StepStone answered 401 to the unlock; the session is no longer valid",
                           code="UNLOCK_SESSION_LOST")
+    if isinstance(status, int) and 400 <= status < 500:
+        # StepStone refused the request itself (wrong shape, gone, forbidden).
+        # It will refuse every further unlock the same way: stop the job instead
+        # of sending one refused unlock per matching candidate. The unlock
+        # history says whether it charged anyway; unverifiable counts as spent.
+        charged = await _unlocked_by_us_recently(page, talent_id)
+        raise UnlockError(
+            f"StepStone refused the unlock with HTTP {status} ({str(data)[:160] if data else 'no body'}); "
+            f"charged={charged}. Every further unlock would be refused the same way.",
+            code="UNLOCK_REJECTED", credit_spent=charged is not False,
+        )
 
     if status != 200 or not isinstance(data, dict) or not isinstance(data.get("personalInfo"), dict):
         # The outcome is unclear (timeout, 5xx, odd body). Ask StepStone whether it
@@ -221,7 +235,12 @@ async def unlock_talent(page: Page, candidate: SearchResult, account_label: str,
             logger.warning(f"Credit cross-check for {talent_id}: balance {before} -> {after} "
                            f"(expected a change of {1 if credit_spent else 0}); trusting the unlock response")
 
-    name, email, phone, home = _contact(data["personalInfo"])
+    try:
+        name, email, phone, home = _contact(data["personalInfo"])
+    except Exception as e:
+        # The credit is spent by now: report it, never crash the job over it.
+        logger.error(f"Unlock of {talent_id}: contact details unreadable ({type(e).__name__}); counting it as spent")
+        return None, credit_spent
     home = home or candidate.wohnort
     cv = await _download_cv(page, talent_id, criteria_id) if candidate.has_cv_attachment else None
     profile_text = (f"Wohnadresse {home}\n" if home else "") + candidate.preview_text

@@ -241,7 +241,9 @@ async def evaluate_candidate(
                 )
                 return EvalResult(error=True, reasoning="Error: could not parse evaluation response")
             return EvalResult(
-                match=bool(data.get("match", False)),
+                # Strictly True: bool("false") is True, and a string verdict
+                # must never unlock (and spend a credit on) a rejected candidate.
+                match=data.get("match") is True or str(data.get("match")).strip().lower() == "true",
                 confidence=float(data.get("confidence", 0.0)),
                 reasoning=str(data.get("reasoning", "")),
             )

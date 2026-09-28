@@ -69,7 +69,8 @@ CONSENT_SAVE_DECLINED = "#ccmgt_preferences_reject"
 LANDING_TIMEOUT_S = 45      # app URL -> login form, or -> the app itself
 LOGIN_FORM_TIMEOUT_S = 60   # arrived on the login host -> its form has rendered
 LOGIN_BLANK_RELOAD_S = 30   # login host still without a form this long -> reload it once
-SESSION_REUSE_TIMEOUT_S = 30
+SESSION_REUSE_TIMEOUT_S = 75   # generous: running out here must never cost a password login
+OWN_FETCH_EVERY_S = 5.0     # our own balance request, at most this often while waiting
 OUTCOME_TIMEOUT_S = 60      # after submit -> the app, an error, or a CAPTCHA
 POLL_INTERVAL_S = 1.0
 TALENT_FINDER_NUDGE_S = 5   # in the app this long without a balance -> open Talent Finder
@@ -100,13 +101,17 @@ NO_FALLBACK_CODES = frozenset({"LOGIN_CAPTCHA", "LOGIN_BLOCKED"})
 
 _CREDITS_JS = """
 async (path) => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 20000);
   try {
-    const r = await fetch(path, { credentials: 'include', headers: { accept: 'application/json' } });
+    const r = await fetch(path, { credentials: 'include', headers: { accept: 'application/json' }, signal: ctl.signal });
     let body = null;
     try { body = await r.json(); } catch (e) {}
     return { status: r.status, body };
   } catch (e) {
     return { status: 0, error: String(e) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 """
@@ -162,6 +167,12 @@ def _load_session(path: str) -> list[dict] | None:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return None
+
+
+def save_session(email: str, cookies: list[dict]) -> None:
+    """Store the account's current cookies (called again after every job)."""
+    if cookies:
+        _save_session(_session_path(email), cookies)
 
 
 def _save_session(path: str, cookies: list[dict]) -> None:
@@ -266,6 +277,7 @@ class _SessionProof:
         self._on_app_since: float | None = None
         self._own_fetch_in_flight = False
         self._talent_finder_visits = 0
+        self._last_own_fetch = float("-inf")
         # Off while a fresh login lands: the cookie jar was just cleared, so
         # Talent Finder can only bounce us to the login page, and on the live
         # site (2026-09-25) that detour cost the login page its time budget.
@@ -322,15 +334,17 @@ class _SessionProof:
             if _host(self.page.url) == LOGIN_HOST and self.talent_finder != "not opened":
                 self.talent_finder = "not opened"
             return None
-        self._own_fetch_in_flight = True
-        try:
-            own, self.own_fetch = await _fetch_credits(self.page)
-        finally:
-            self._own_fetch_in_flight = False
-        if own is not None:
-            self.credits = own
-            return own
         now = asyncio.get_running_loop().time()
+        if now - self._last_own_fetch >= OWN_FETCH_EVERY_S:
+            self._last_own_fetch = now
+            self._own_fetch_in_flight = True
+            try:
+                own, self.own_fetch = await _fetch_credits(self.page)
+            finally:
+                self._own_fetch_in_flight = False
+            if own is not None:
+                self.credits = own
+                return own
         if self._on_app_since is None:
             self._on_app_since = now
         elif (self.nudge and self.talent_finder == "not opened" and self._talent_finder_visits < 3
@@ -572,9 +586,20 @@ async def _authenticate(context: BrowserContext, page: Page, proof: _SessionProo
                 f"{await _describe_page(page, proof)}",
                 code="LOGIN_BLOCKED",
             )
+        if state != "login_form":
+            # Only StepStone sending us to its login form proves the saved
+            # session is dead. A slow or failed page load through the proxy
+            # proves nothing, and typing the password because of it is one more
+            # fresh login from a residential IP: what the bot check reacts to.
+            # Keep the saved cookies and let the next job try them again.
+            raise AuthenticationError(
+                f"the saved session did not load within {SESSION_REUSE_TIMEOUT_S}s (landing: {state}); "
+                f"no password was typed. {await _describe_page(page, proof)}",
+                code="SESSION_REUSE_TIMEOUT",
+            )
         logger.warning(
-            f"Saved session for {email} did not prove itself (landing: {state}; "
-            f"{proof.describe()}). Falling through to a fresh login, which costs no credits."
+            f"Saved session for {email} has expired (StepStone showed its login form). "
+            f"Logging in again."
         )
         # A fresh login must not be 'proven' by a stale response seen above.
         proof.credits = None

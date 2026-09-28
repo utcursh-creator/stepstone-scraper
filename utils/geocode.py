@@ -178,6 +178,11 @@ def _rate_limited_geocode(query: str) -> tuple[float, float] | None:
     return result
 
 
+def geocoder_blocked() -> bool:
+    """True while a 429 cooldown is running (no request would be sent)."""
+    return time.time() < _blocked_until
+
+
 def geocode_location(location: str) -> tuple[float, float] | None:
     """Resolve a place name to (lat, lon), or None if it cannot be resolved.
 

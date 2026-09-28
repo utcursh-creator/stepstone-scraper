@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from models.candidate import CandidateResult, ScrapeResult
 from models.config import Settings
 from models.job import JobInput
-from scraper.auth import NO_FALLBACK_CODES, AuthenticationError, authenticate
+from scraper.auth import NO_FALLBACK_CODES, AuthenticationError, authenticate, save_session
 from scraper.browser import close_browser, create_browser
 from scraper.dedup import check_duplicate
 from scraper.talent_unlock import UnlockError, unlock_talent
@@ -27,6 +27,7 @@ from utils.geocode import (
     calculate_distance_km,
     check_desired_location_match,
     geocode_location,
+    geocoder_blocked,
     GeocoderUnavailable,
     strip_ortsteil,
     should_accept_far_candidate,
@@ -59,6 +60,12 @@ COUNTER_PATH = os.path.join(STATE_DIR, "account_counter.json")
 # this one bad login becomes one login per queued job, from rotating proxy IPs:
 # exactly what trips StepStone's bot check and gets an account locked.
 AUTH_COOLDOWN_S = 3 * 3600
+
+# A job stops taking new candidates after this long and reports what it has;
+# the hard limit below is only for a job that hangs outright.
+JOB_SOFT_LIMIT_S = 45 * 60
+JOB_HARD_LIMIT_S = 60 * 60
+MAX_CONSECUTIVE_UNLOCK_FAILURES = 2
 _auth_blocked_until: float = 0.0
 _auth_block_reason: str = ""
 
@@ -287,6 +294,18 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         current_status["error"] = msg
         return result
 
+    if geocoder_blocked():
+        msg = (
+            "GEOCODER_UNAVAILABLE: the map lookup service is rate-limiting this server right now, "
+            "so candidate distances cannot be checked. Nothing was searched and no credits were "
+            "spent; the job runs again on the next cycle."
+        )
+        logger.error(msg)
+        result.partial = True
+        result.error = msg
+        current_status["error"] = msg
+        return result
+
     if time.time() < _auth_blocked_until:
         msg = (
             f"AUTH_COOLDOWN: the last login to StepStone failed, so no login is attempted "
@@ -309,7 +328,10 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
     # reject every relocation candidate on those jobs as too_far_no_relocation.
     job_location_base = strip_ortsteil(job.location)
 
+    job_deadline = time.monotonic() + JOB_SOFT_LIMIT_S
     browser = None
+    context = None
+    authenticated_email = None
     try:
         # 1. Launch browser
         logger.info(f"Launching browser for {job.job_title} in {job.location}")
@@ -323,23 +345,34 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         )
 
         # 2. Authenticate
-        logger.info(f"Authenticating as {account['email']}")
+        logger.info(f"Authenticating as Account {accounts.index(account) + 1}")
         try:
             captcha_solver = None
             if settings.twocaptcha_api_key:
                 from twocaptcha import TwoCaptcha
                 captcha_solver = TwoCaptcha(settings.twocaptcha_api_key)
 
-            await authenticate(context, page, account["email"], account["password"], captcha_solver)
+            try:
+                await authenticate(context, page, account["email"], account["password"], captcha_solver)
+            except AuthenticationError:
+                raise
+            except Exception as raw:
+                # A Playwright timeout or crash mid-login is still a login attempt:
+                # it must reach the same handling (cooldown, no fallback) as any other.
+                raise AuthenticationError(f"{type(raw).__name__}: {str(raw)[:200]}", code="LOGIN_ERROR") from raw
+            authenticated_email = account["email"]
             logger.info("Authentication successful")
         except AuthenticationError as e:
-            logger.error(f"Auth failed for {account['email']}: {e}")
+            logger.error(f"Auth failed for Account {accounts.index(account) + 1}: {e}")
             failures = [f"{account['email']}: {e}"]
-            # A CAPTCHA or an edge block is about this browser and IP, not the
-            # account. Logging the second account in from the same browser right
-            # after one is another suspicious login, which is how accounts get
-            # locked. Only a rejection of THIS account's credentials falls back.
-            if e.code in NO_FALLBACK_CODES:
+            # Only a rejection of THIS account's password justifies trying the
+            # second account. Everything else (CAPTCHA, block, timeouts, a slow
+            # proxy) is about this browser and IP: a second password login from
+            # it seconds later is how accounts get locked. A saved session that
+            # merely loaded slowly typed no password and blocks nothing.
+            if e.code == "SESSION_REUSE_TIMEOUT":
+                raise
+            if e.code != "LOGIN_REJECTED":
                 _block_logins(failures[0])
                 raise AuthenticationError(
                     "All accounts failed to authenticate (the second account was NOT tried "
@@ -354,13 +387,13 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     await authenticate(context, page, alt["email"], alt["password"], captcha_solver)
                     account_label = f"Account {accounts.index(alt) + 1}"
                     result.account_used = account_label
-                    logger.info(f"Authenticated with fallback account {alt['email']}")
+                    authenticated_email = alt["email"]
+                    logger.info(f"Authenticated with fallback {account_label}")
                     authenticated = True
                     break
-                except AuthenticationError as alt_error:
+                except Exception as alt_error:
                     failures.append(f"{alt['email']}: {alt_error}")
-                    if alt_error.code in NO_FALLBACK_CODES:
-                        break
+                    break
             if not authenticated:
                 _block_logins(" | ".join(failures))
                 raise AuthenticationError(
@@ -404,7 +437,18 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         )
         processed = 0
         consecutive_eval_errors = 0
+        consecutive_unlock_failures = 0
+        seen_profiles: set[str] = set()
         async for candidate in search.iterate():
+            if candidate.profile_id in seen_profiles:
+                continue  # the same talent on two result pages: handle once
+            seen_profiles.add(candidate.profile_id)
+            if time.monotonic() > job_deadline:
+                # A normal partial run (like the per-job cap), not an error: n8n
+                # still posts the summary to Slack and chains the next job.
+                logger.warning("Job time budget used up; stopping with the results so far.")
+                result.partial = True
+                break
             if processed >= effective_max_candidates:
                 logger.info(
                     f"Reached per-job cap ({effective_max_candidates}); stopping this job."
@@ -458,6 +502,30 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     f"  Card-level distance for {candidate.profile_id}: "
                     f"Wohnort={wohnort}, distance={distance_km}km"
                 )
+
+            if wohnort and distance_km is None:
+                # The card names a home town, but it cannot be placed in Germany
+                # (abroad, or unresolvable). After an unlock the profile shows the
+                # same place and the fail-closed gate rejects it: a credit paid for
+                # a certain rejection. Reject it now, for free.
+                logger.info(f"  REJECTED {candidate.profile_id} before unlock: home town not locatable in Germany")
+                result.candidates.append(
+                    CandidateResult(
+                        name="",
+                        stepstone_profile_id=candidate.profile_id,
+                        matched=False,
+                        match_confidence=0.0,
+                        match_reasoning=(
+                            f"ABGELEHNT: Wohnort {wohnort} lässt sich nicht in Deutschland verorten; "
+                            f"Entfernung zu {job.location} nicht prüfbar."
+                        ),
+                        unlocked=False,
+                        unlock_reason="location_unverifiable",
+                        account_used=account_label,
+                    )
+                )
+                processed += 1
+                continue
 
             if distance_km is not None and distance_km > job.max_distance_km:
                 accepted, dist_reason = should_accept_far_candidate(
@@ -597,14 +665,20 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     page, candidate, account_label, search.criteria_id,
                 )
             except UnlockError as e:
-                # No credits left, or the session is gone: every further
-                # unlock would fail the same way. Stop, and say why.
+                # No credits left, the session is gone, or StepStone refuses the
+                # unlock itself: every further unlock would fail the same way.
+                # Stop, and say why. A credit it may have taken is still charged.
+                if e.credit_spent:
+                    unlock_budget.record_unlock(UNLOCK_COUNTER_PATH, today)
                 logger.error(f"Stopping the job: {e}")
                 result.partial = True
                 result.error = str(e)
                 break
             if profile:
                 profile.credit_spent = credit_spent
+                consecutive_unlock_failures = 0
+            else:
+                consecutive_unlock_failures += 1
             # Charge the budget for every credit StepStone actually took, NOT
             # only the ones we got data back from. These are different events:
             # the click spends the credit, and the dialog can still fail to
@@ -641,10 +715,8 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                     )
                     if already_exists:
                         logger.info(
-                            f"  RECRUITEE DEDUP: {candidate.profile_id} "
-                            f"(email={profile.email!r}, phone={profile.phone!r}) "
-                            f"already exists in Recruitee (candidate {existing_candidate_id}, "
-                            f"placed on offers: {existing_offer_ids})"
+                            f"  RECRUITEE DEDUP: {candidate.profile_id} already exists in Recruitee "
+                            f"(candidate {existing_candidate_id}, placed on offers: {existing_offer_ids})"
                         )
                         profile.matched = True
                         profile.match_confidence = eval_result.confidence
@@ -855,6 +927,18 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
                         account_used=account_label,
                     )
                 )
+                if consecutive_unlock_failures >= MAX_CONSECUTIVE_UNLOCK_FAILURES:
+                    # Something is systematically wrong with unlocking. Do not
+                    # try it on every remaining match (each may cost a credit).
+                    result.partial = True
+                    result.error = (
+                        f"UNLOCK_FAILING: {consecutive_unlock_failures} unlocks in a row returned no "
+                        f"candidate details, so the job stopped before trying more. Credits StepStone "
+                        f"may have taken are recorded. Send the Railway logs to Apex; do not re-run."
+                    )
+                    logger.error(result.error)
+                    processed += 1
+                    break
 
             processed += 1
             await human_delay(1000, 3000)
@@ -867,6 +951,8 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         # payload, where n8n's aborted branch can see it. current_status is only
         # visible on /status, which nothing polls. Keep an earlier, more precise
         # abort reason (e.g. the eval-error threshold) if one was already set.
+        if not result.error and isinstance(e, AuthenticationError) and e.code == "SESSION_REUSE_TIMEOUT":
+            result.error = str(e)  # "SESSION_REUSE_TIMEOUT: ..." (no password was typed)
         if not result.error and isinstance(e, GeocoderUnavailable):
             # Mid-run: a candidate's distance could not be checked. Stopped
             # rather than unlocking someone whose distance is unknown.
@@ -879,6 +965,13 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             result.error = f"Scrape crashed: {type(e).__name__}: {e}"
         current_status["error"] = str(e)
     finally:
+        if context is not None and authenticated_email:
+            # Cookies rotate during a job; the next job must start from the
+            # newest ones, or it may find the session dead and type the password.
+            try:
+                save_session(authenticated_email, await context.cookies())
+            except Exception as e:
+                logger.warning(f"Could not save the session after the job: {type(e).__name__}")
         if browser:
             await close_browser(browser)
 
@@ -892,7 +985,20 @@ async def scrape(job: JobInput, background_tasks: BackgroundTasks):
 
     async def locked_scrape():
         async with scrape_lock:
-            result = await run_scrape(job)
+            try:
+                result = await asyncio.wait_for(run_scrape(job), timeout=JOB_HARD_LIMIT_S)
+            except Exception as e:
+                # A hang (timeout) or a crash outside run_scrape's own handler:
+                # n8n must still hear about the job, or its chain waits forever.
+                logger.error(f"Job ended without a result: {type(e).__name__}: {e}")
+                reason = ("JOB_HARD_TIMEOUT: the job hung and was stopped after "
+                          f"{JOB_HARD_LIMIT_S // 60} min" if isinstance(e, asyncio.TimeoutError)
+                          else f"Scrape crashed: {type(e).__name__}: {e}")
+                result = ScrapeResult(
+                    offer_id=job.offer_id, stage_id=job.stage_id, job_title=job.job_title,
+                    location=job.location, requirements=job.requirements, account_used="",
+                    partial=True, error=reason,
+                )
         # Lock released here — n8n's chain-dispatch will now get 202, not 409.
         current_status["state"] = "idle"
         current_status["job"] = None

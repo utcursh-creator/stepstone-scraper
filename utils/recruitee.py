@@ -430,7 +430,7 @@ async def check_candidate_exists_in_recruitee(
                 if isinstance(e, str)
             ]
             if email_lower in candidate_emails:
-                return _dedup_hit(candidate, f"email={email_lower!r}")
+                return _dedup_hit(candidate, "email")
 
         # Phone match
         if phone_norm:
@@ -440,7 +440,7 @@ async def check_candidate_exists_in_recruitee(
             ]
             candidate_phones_norm = [p for p in candidate_phones_norm if p]
             if phone_norm in candidate_phones_norm:
-                return _dedup_hit(candidate, f"phone={phone_norm!r}")
+                return _dedup_hit(candidate, "phone")
 
     # Pass 2: exact name + phone digit-suffix. Only reached when both exact
     # signals missed on every candidate. The phone suffix must corroborate —
@@ -455,14 +455,11 @@ async def check_candidate_exists_in_recruitee(
             if phone:
                 for cand_phone in (candidate.get("phones") or []):
                     if isinstance(cand_phone, str) and _phone_suffix_match(phone, cand_phone):
-                        return _dedup_hit(
-                            candidate,
-                            f"name+phone-suffix (name={name_norm!r}, "
-                            f"phone={phone!r} ~ {cand_phone!r})",
-                        )
+                        return _dedup_hit(candidate, "name+phone-suffix")
 
+    # Presence flags only: contact details never go to the logs.
     logger.info(
-        f"Recruitee dedup MISS: email={email!r} phone={phone!r} name={name!r} "
-        f"(phone_norm={phone_norm!r}) not found in {len(candidates)} candidates"
+        f"Recruitee dedup MISS: email={'yes' if email else 'no'} phone={'yes' if phone else 'no'} "
+        f"name={'yes' if name else 'no'}; not found in {len(candidates)} candidates"
     )
     return False, None, []

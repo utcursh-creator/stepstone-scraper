@@ -47,8 +47,11 @@ _HOME_COUNTRIES = {"DE", "DEU", "GERMANY", "DEUTSCHLAND"}
 
 _FETCH_JS = """
 async ({ url, method, body }) => {
+  // A request stalled at the proxy must fail, not hang the job (and the chain) forever.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 60000);
   try {
-    const init = { method, credentials: 'include', headers: { accept: 'application/json' } };
+    const init = { method, credentials: 'include', headers: { accept: 'application/json' }, signal: ctl.signal };
     if (body !== null && body !== undefined) {
       init.headers['content-type'] = 'application/json';
       init.body = JSON.stringify(body);
@@ -59,6 +62,8 @@ async ({ url, method, body }) => {
     return { status: r.status, body: json };
   } catch (e) {
     return { status: 0, error: String(e) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 """

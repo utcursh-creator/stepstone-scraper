@@ -56,6 +56,9 @@ async def create_browser(
     page = await context.new_page()
     page.set_default_navigation_timeout(120_000)
 
+    # close_browser stops the driver too; left running, each job leaked one
+    # Playwright node process (13 per full run).
+    browser._stepstone_driver = p
     return browser, context, page
 
 
@@ -65,3 +68,9 @@ async def close_browser(browser: Browser) -> None:
         await browser.close()
     except Exception:
         pass
+    driver = getattr(browser, "_stepstone_driver", None)
+    if driver is not None:
+        try:
+            await driver.stop()
+        except Exception:
+            pass
