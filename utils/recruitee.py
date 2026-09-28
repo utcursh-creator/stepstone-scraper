@@ -28,6 +28,7 @@ Each call retries up to MAX_RETRIES times with RETRY_DELAY_SECONDS backoff.
 import asyncio
 import json
 import logging
+import time
 import re
 import httpx
 
@@ -39,16 +40,22 @@ RETRY_DELAY_SECONDS = 2.0
 REQUEST_TIMEOUT = 30.0
 CANDIDATES_PAGE_SIZE = 100  # Recruitee /candidates default; we paginate explicitly
 
-# Per-scrape cache of all Recruitee candidates. Populated on first dedup check,
-# reused for the rest of the run. Cleared via clear_candidates_cache() at the
-# start of every scrape job (called from main.run_scrape).
+# Cache of all Recruitee candidates for the dedup check, shared by the jobs of
+# one run. Aramaz has ~46k candidates (464 pages, ~4.5 min to fetch, live
+# 2026-09-28); refetching it for every job of a 13-job run meant ~6,000 requests
+# and up to an hour, and invited a rate limit that would leave dedup blind.
+# Candidates this process creates are added to it as they are pushed.
+CANDIDATES_CACHE_TTL_S = 3 * 3600
 _candidates_cache: list[dict] | None = None
+_candidates_cache_at: float = 0.0
 
 
-def clear_candidates_cache() -> None:
-    """Reset the Recruitee candidate cache between scrape jobs."""
+def clear_candidates_cache(force: bool = False) -> None:
+    """Called at the start of every job: drops the cache once it is older than
+    CANDIDATES_CACHE_TTL_S (or when forced), so a run fetches it once."""
     global _candidates_cache
-    _candidates_cache = None
+    if force or time.monotonic() - _candidates_cache_at > CANDIDATES_CACHE_TTL_S:
+        _candidates_cache = None
 
 
 class RecruiteeError(Exception):
@@ -143,6 +150,11 @@ async def create_candidate(
 
     placement_id: int = placements[0]["id"]
     logger.info(f"Recruitee candidate created: candidate_id={candidate_id} placement_id={placement_id}")
+    if _candidates_cache is not None:
+        # The cache outlives the job now: later jobs of the run must see this
+        # candidate, or the same person could be pushed again for another offer.
+        _candidates_cache.append({"id": candidate_id, "name": name, "emails": list(emails),
+                                  "phones": list(phones), "placements": [{"offer_id": offer_id}]})
     return candidate_id, placement_id
 
 
@@ -231,9 +243,10 @@ async def _fetch_all_candidates(token: str, company_id: str) -> list[dict]:
       filter syntax. With ~hundreds of candidates per Aramaz account, the cost
       is acceptable (one paginated fetch per scrape run, then in-memory filter).
     """
-    global _candidates_cache
+    global _candidates_cache, _candidates_cache_at
     if _candidates_cache is not None:
         return _candidates_cache
+    complete = False
 
     url = f"{RECRUITEE_API}/c/{company_id}/candidates"
     all_candidates: list[dict] = []
@@ -259,6 +272,7 @@ async def _fetch_all_candidates(token: str, company_id: str) -> list[dict]:
 
             if len(batch) < CANDIDATES_PAGE_SIZE:
                 # Last page reached
+                complete = True
                 break
             offset += CANDIDATES_PAGE_SIZE
 
@@ -266,7 +280,13 @@ async def _fetch_all_candidates(token: str, company_id: str) -> list[dict]:
         f"Recruitee dedup cache: fetched {len(all_candidates)} candidates "
         f"across {(offset // CANDIDATES_PAGE_SIZE) + 1} page(s)"
     )
-    _candidates_cache = all_candidates
+    if complete:
+        _candidates_cache = all_candidates
+        _candidates_cache_at = time.monotonic()
+    else:
+        # A partial list must not be kept for the rest of the run: the next
+        # check fetches again instead of trusting an incomplete dedup base.
+        logger.warning("Recruitee dedup list is incomplete; not caching it")
     return all_candidates
 
 

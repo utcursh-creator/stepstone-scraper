@@ -28,9 +28,9 @@ def no_retry_sleep(monkeypatch):
 @pytest.fixture(autouse=True)
 def reset_dedup_cache():
     """Clear the per-scrape candidates cache so each test starts fresh."""
-    clear_candidates_cache()
+    clear_candidates_cache(force=True)
     yield
-    clear_candidates_cache()
+    clear_candidates_cache(force=True)
 
 
 # -- create_candidate --
@@ -374,7 +374,7 @@ async def test_dedup_phone_normalisation_matches_all_german_variants():
         ])),
     )
     for variant in ["+49 171 1234567", "0049 171 1234567", "0171 1234567", "01711234567", "(0171) 123-4567"]:
-        clear_candidates_cache()
+        clear_candidates_cache(force=True)
         respx.get(f"{BASE}/candidates").mock(
             return_value=httpx.Response(200, json=_candidates_page([
                 {"id": 666, "emails": [], "phones": ["+49 171 1234567"], "placements": []},
