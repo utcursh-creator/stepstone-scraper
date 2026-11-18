@@ -20,6 +20,8 @@ no real account. The lessons of the old login stay pinned here:
     rides into another's (2026-08-03)
 """
 import json
+from datetime import datetime, timezone
+from urllib.parse import parse_qs
 
 import pytest
 from patchright.async_api import async_playwright
@@ -48,12 +50,31 @@ APP_HTML = """<!doctype html><html><head><title>Stepstone Recruit</title></head>
 <div id="app"></div>
 <script>
 const val = (n) => (document.cookie.split('; ').find((c) => c.startsWith(n + '=')) || '').split('=')[1];
+// Like the live app (auth0-spa-js with refresh tokens, seen 2026-09-25): it
+// keeps its own login in localStorage and renews it at the login host's
+// /oauth/token, without the login page and without the login session cookie.
+const KEEPS_LOGIN = __KEEPS_LOGIN__;
+const STALL_ON_REFUSED = __STALL_ON_REFUSED__;  // a refused token leaves the app stuck (unknown live)
+const STORE_KEY = '@@auth0spajs@@::test-client::https://recruit.test::openid profile email offline_access';
+const keep = (rt, scope) => localStorage.setItem(STORE_KEY, JSON.stringify({ body: { refresh_token: rt, scope }, expiresAt: 0 }));
 function boot() {
   if (location.pathname === '/callback') {
-    document.cookie = 'tf_session=' + new URLSearchParams(location.search).get('code') + '; path=/';
+    const code = new URLSearchParams(location.search).get('code');
+    document.cookie = 'tf_session=' + code + '; path=/';
+    if (KEEPS_LOGIN) keep('rt-' + code, 'openid profile email offline_access');
     location.replace('/'); return;
   }
-  if (val('tf_session') && val('tf_session') !== 'expired') {
+  const loggedIn = val('tf_session') && val('tf_session') !== 'expired';
+  if (!loggedIn && KEEPS_LOGIN && localStorage.getItem(STORE_KEY)) {
+    const rt = JSON.parse(localStorage.getItem(STORE_KEY)).body.refresh_token;
+    fetch('https://login.recruit.stepstone.com/oauth/token', { method: 'POST',
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rt }) })
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+      .then((t) => { keep(t.refresh_token, t.scope); document.cookie = 'tf_session=' + t.session + '; path=/'; boot(); })
+      .catch(() => { if (STALL_ON_REFUSED) return; localStorage.removeItem(STORE_KEY); boot(); });
+    return;
+  }
+  if (loggedIn) {
     // Like the real app: its own fetch carries its auth header. Only code in
     // the page's MAIN world goes through this wrapper.
     const origFetch = window.fetch;
@@ -167,6 +188,10 @@ class FakeStepstone:
         self.search_total = 27
         self.remaining = CREDITS["remainingCredits"]
         self.unlock_requests = []
+        self.app_keeps_login = False    # the app keeps a renewable login in localStorage (the live app)
+        self.stall_on_refused_token = False
+        self.used_refresh_tokens = set()
+        self.token_refreshes = []       # account renewed through /oauth/token, in order
 
     async def handle(self, route):
         req = route.request
@@ -227,7 +252,22 @@ class FakeStepstone:
             return await route.fulfill(status=200, content_type="text/html",
                                        body=APP_HTML.replace("__LOGIN_TARGET__", self.login_target)
                                        .replace("__TF_BROKEN__", "true" if self.tf_broken else "false")
+                                       .replace("__KEEPS_LOGIN__", "true" if self.app_keeps_login else "false")
+                                       .replace("__STALL_ON_REFUSED__", "true" if self.stall_on_refused_token else "false")
                                        .replace("__REDIRECT_DELAY_MS__", str(self.redirect_delay_ms)))
+        if host == "login.recruit.stepstone.com" and path.startswith("/oauth/token"):
+            # Rotating refresh tokens, like Auth0: each one works once.
+            rt = (parse_qs(req.post_data or "").get("refresh_token") or [""])[0]
+            cors = {"Access-Control-Allow-Origin": "https://recruit.stepstone.com"}
+            if "session-for-" not in rt or rt in self.used_refresh_tokens:
+                return await route.fulfill(status=403, headers=cors, content_type="application/json",
+                                           body='{"error": "invalid_grant"}')
+            self.used_refresh_tokens.add(rt)
+            session = "session-for-" + rt.split("session-for-", 1)[1]
+            self.token_refreshes.append(session.split("session-for-", 1)[1])
+            return await route.fulfill(status=200, headers=cors, content_type="application/json", body=json.dumps({
+                "refresh_token": f"rt{len(self.token_refreshes)}-{session}", "session": session,
+                "scope": "openid profile email offline_access", "expires_in": 300}))
         if host in ("login.recruit.stepstone.com", "login.stepstone-security.test"):
             blank = self.login_blank_loads > 0
             self.login_blank_loads -= 1
@@ -238,7 +278,8 @@ class FakeStepstone:
         return await route.fulfill(status=404, body="")
 
     def login_page_hits(self):
-        return [h for h in self.hits if h[0] == "login.recruit.stepstone.com"]
+        # The app renewing its own login at /oauth/token is not the login page.
+        return [h for h in self.hits if h[0] == "login.recruit.stepstone.com" and h[1] != "/oauth/token"]
 
 
 @pytest.fixture
@@ -423,7 +464,7 @@ async def test_a_dead_saved_session_falls_back_to_a_fresh_login(site):
     assert credits["remainingCredits"] == 147
     assert fake.login_page_hits(), "a dead session must trigger a fresh login"
     saved = json.loads((tmp / f"{EMAIL}.json").read_text())
-    assert any(c["name"] == "tf_session" and c["value"].startswith("session-for-") for c in saved), \
+    assert any(c["name"] == "tf_session" and c["value"].startswith("session-for-") for c in saved["cookies"]), \
         "the NEW session must be saved for the next job"
 
 
@@ -440,6 +481,181 @@ async def test_a_second_account_never_rides_on_the_first_accounts_session(site):
         "account 2 must type its own credentials, not inherit account 1's session"
     session = {c["name"]: c["value"] for c in await context.cookies("https://recruit.stepstone.com")}
     assert session["tf_session"] == "session-for-second@example.test"
+
+
+async def test_a_fresh_login_keeps_the_device_id_but_no_old_session(site):
+    """The login host's "did" names the browser, not an account or a session.
+    Dropping it made every fresh login look like a brand-new device."""
+    fake, context, page, _ = site
+    await context.add_cookies([
+        _cookie("did", "device-1", "login.recruit.stepstone.com"),
+        _cookie("did_compat", "device-1", "login.recruit.stepstone.com"),
+        _cookie("auth0", "old-login-session", "login.recruit.stepstone.com"),
+        _cookie("did", "not-the-login-host"),
+        _cookie("tf_session", "session-for-someone-else"),
+    ])
+
+    await authenticate(context, page, EMAIL, PASSWORD)
+
+    login = {c["name"]: c["value"] for c in await context.cookies("https://login.recruit.stepstone.com")}
+    assert login.get("did") == "device-1" and login.get("did_compat") == "device-1"
+    assert "auth0" not in login, "the old login session must not survive a fresh login"
+    app = {c["name"]: c["value"] for c in await context.cookies("https://recruit.stepstone.com")}
+    assert app["tf_session"] == f"session-for-{EMAIL}"
+    assert app.get("did") is None, "only the login host's device id is kept"
+
+
+async def _next_job(context, fake):
+    """A new browser for the next job, built from the saved login the way
+    create_browser builds it."""
+    nxt = await context.browser.new_context(locale="de-DE", storage_state=auth_mod.load_login(EMAIL))
+    await nxt.route("**/*", fake.handle)
+    return nxt, await nxt.new_page()
+
+
+def _end_stepstones_login_session(path):
+    """What a week does (live, Nov 13 and Nov 16 2026): StepStone's login
+    session is over, so the saved cookies alone no longer get in."""
+    saved = json.loads(path.read_text())
+    for c in saved["cookies"]:
+        if c["name"] == "tf_session":
+            c["value"] = "expired"
+    path.write_text(json.dumps(saved))
+
+
+async def test_the_apps_stored_login_outlives_stepstones_login_session(site):
+    """The weekly password login (and its CAPTCHA) came from saving only the
+    cookies: the app's own renewable login lives in localStorage and was
+    thrown away after every job. Saved with the cookies, it gets the next job
+    in after StepStone's login session has ended, without the password."""
+    fake, context, page, tmp = site
+    fake.app_keeps_login = True
+    await authenticate(context, page, EMAIL, PASSWORD)
+    _end_stepstones_login_session(tmp / f"{EMAIL}.json")
+    logins = len(fake.login_page_hits())
+
+    nxt, page2 = await _next_job(context, fake)
+    credits = await authenticate(nxt, page2, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
+    assert len(fake.login_page_hits()) == logins, "no login page and no password: the app renewed its own login"
+    assert fake.token_refreshes == [EMAIL]
+    saved = json.loads((tmp / f"{EMAIL}.json").read_text())
+    stored = {i["name"]: i["value"] for o in saved["origins"] if o["origin"] == "https://recruit.stepstone.com"
+              for i in o["localStorage"]}
+    assert any(json.loads(v)["body"]["refresh_token"].startswith("rt1-") for v in stored.values()), \
+        "the renewed token is saved: the one just used works only once"
+
+
+async def test_a_second_account_never_rides_on_the_first_accounts_stored_login(site):
+    """A fresh login forgets the app's stored login as well as the cookies:
+    otherwise the app would renew account 1's login while account 2 logs in,
+    and the job would spend account 1's credits."""
+    fake, context, page, _ = site
+    fake.app_keeps_login = True
+    await authenticate(context, page, EMAIL, PASSWORD)
+
+    await authenticate(context, page, OTHER_EMAIL, OTHER_PASSWORD)
+
+    assert fake.token_refreshes == [], "account 1's stored login was never used again"
+    session = {c["name"]: c["value"] for c in await context.cookies("https://recruit.stepstone.com")}
+    assert session["tf_session"] == f"session-for-{OTHER_EMAIL}"
+
+
+async def test_the_saved_login_knows_when_the_password_was_typed(site, caplog):
+    """How long a login lasts is the question every expiry raises; the saved
+    login answers it, and each reuse says which route got it in."""
+    fake, context, page, tmp = site
+    fake.app_keeps_login = True
+    caplog.set_level("INFO")
+    await authenticate(context, page, EMAIL, PASSWORD)
+    typed_at = json.loads((tmp / f"{EMAIL}.json").read_text())["password_login_at"]
+    assert abs((datetime.now(timezone.utc) - datetime.fromisoformat(typed_at)).total_seconds()) < 60
+    assert "renewable: yes" in caplog.text and "offline_access: yes" in caplog.text, \
+        "the log says whether the app's login can outlive StepStone's login session"
+
+    _end_stepstones_login_session(tmp / f"{EMAIL}.json")
+    nxt, page2 = await _next_job(context, fake)
+    await authenticate(nxt, page2, EMAIL, PASSWORD)
+
+    assert fake.token_refreshes == [EMAIL], "the route is named from what was seen: a renewal happened"
+    assert json.loads((tmp / f"{EMAIL}.json").read_text())["password_login_at"] == typed_at, \
+        "a reuse keeps the time of the last password login"
+    assert "through the app's stored login" in caplog.text
+    assert "password last typed 0.0 days ago" in caplog.text
+
+
+async def test_a_renewed_token_is_saved_even_when_the_reuse_does_not_finish(site):
+    """The app renews its token as soon as it loads. If the reuse then times
+    out (a slow proxy), the browser holds the new token and the file the used
+    one: the next job would send the used token, and StepStone cancels the
+    whole chain when a used token comes back."""
+    fake, context, page, tmp = site
+    fake.app_keeps_login = True
+    await authenticate(context, page, EMAIL, PASSWORD)
+    _end_stepstones_login_session(tmp / f"{EMAIL}.json")
+    fake.credits_mode = "refused"   # in the app, but the balance never comes
+
+    nxt, page2 = await _next_job(context, fake)
+    with pytest.raises(AuthenticationError) as err:
+        await authenticate(nxt, page2, EMAIL, PASSWORD)
+
+    assert err.value.code == "SESSION_REUSE_TIMEOUT"
+    assert fake.token_refreshes == [EMAIL]
+    saved = json.loads((tmp / f"{EMAIL}.json").read_text())
+    tokens = [json.loads(i["value"])["body"]["refresh_token"] for o in saved["origins"] for i in o["localStorage"]
+              if i["name"].startswith("@@auth0spajs@@")]
+    assert tokens and tokens[0].startswith("rt1-"), "the renewed token, not the used one"
+
+
+async def test_a_stored_login_stepstone_refused_is_dropped(site, caplog):
+    """A refused token loaded into every later job could leave the app stuck
+    each time (neither the app nor the login form): no job would ever run.
+    Dropped, the next job falls back to the cookies alone, as before."""
+    fake, context, page, tmp = site
+    fake.app_keeps_login = True
+    fake.stall_on_refused_token = True
+    await authenticate(context, page, EMAIL, PASSWORD)
+    _end_stepstones_login_session(tmp / f"{EMAIL}.json")
+    fake.used_refresh_tokens.add(f"rt-session-for-{EMAIL}")   # StepStone no longer accepts it
+
+    nxt, page2 = await _next_job(context, fake)
+    with pytest.raises(AuthenticationError) as err:
+        await authenticate(nxt, page2, EMAIL, PASSWORD)
+
+    assert err.value.code == "SESSION_REUSE_TIMEOUT"
+    assert "app login renewals: 403" in str(err.value)
+    assert json.loads((tmp / f"{EMAIL}.json").read_text())["origins"] == []
+    assert await _submits(page2) == 0, "no password was typed"
+
+
+async def test_a_login_that_worked_is_not_failed_by_its_save(site, monkeypatch):
+    """Saving the whole login opens a helper page of its own. If that fails,
+    the login still counts, and its cookies are kept so the next job does not
+    type the password again."""
+    fake, context, page, tmp = site
+
+    async def broken():
+        raise RuntimeError("Target page, context or browser has been closed")
+    monkeypatch.setattr(context, "storage_state", broken)
+
+    credits = await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
+    saved = json.loads((tmp / f"{EMAIL}.json").read_text())
+    assert any(c["name"] == "tf_session" for c in saved["cookies"]) and saved["password_login_at"]
+
+
+def test_a_login_saved_before_this_change_still_loads(tmp_path, monkeypatch):
+    """Until Nov 2026 the file was a plain list of cookies."""
+    monkeypatch.setattr(auth_mod, "_session_path", lambda email: str(tmp_path / f"{email}.json"))
+    cookies = [_cookie("tf_session", "session-for-recruiter")]
+    (tmp_path / f"{EMAIL}.json").write_text(json.dumps(cookies))
+
+    assert auth_mod.load_login(EMAIL) == {"cookies": cookies, "origins": []}
+    (tmp_path / f"{EMAIL}.json").write_text("{not json")
+    assert auth_mod.load_login(EMAIL) is None
+    assert auth_mod.load_login(OTHER_EMAIL) is None
 
 
 async def test_wrong_credentials_fail_with_the_pages_own_message(site):
@@ -611,3 +827,36 @@ async def test_a_successful_login_sets_no_cooldown(monkeypatch):
     await main_mod.run_scrape(_job())
 
     assert calls == [EMAIL, EMAIL]
+
+
+async def test_a_job_starts_from_the_saved_login_and_saves_it_again(monkeypatch, tmp_path):
+    """The browser is built from the whole saved login (cookies and the app's
+    localStorage), and the job ends by saving the whole login again: the app
+    renews its token during the job, and the old one works only once."""
+    monkeypatch.setattr(auth_mod, "_session_path", lambda email: str(tmp_path / f"{email}.json"))
+    saved = {"cookies": [_cookie("tf_session", "session-for-recruiter")],
+             "origins": [{"origin": "https://recruit.stepstone.com",
+                          "localStorage": [{"name": "k", "value": "token-1"}]}],
+             "password_login_at": "2026-11-18T05:12:46+00:00"}
+    (tmp_path / f"{EMAIL}.json").write_text(json.dumps(saved))
+    built = {}
+
+    class Ctx:
+        async def storage_state(self):
+            return {"cookies": saved["cookies"],
+                    "origins": [{"origin": "https://recruit.stepstone.com",
+                                 "localStorage": [{"name": "k", "value": "token-2"}]}]}
+
+    async def fake_browser(*a, **k):
+        built.update(k)
+        return object(), Ctx(), object()
+
+    _wire_main(monkeypatch, {EMAIL: None, OTHER_EMAIL: None})
+    monkeypatch.setattr(main_mod, "create_browser", fake_browser)
+
+    await main_mod.run_scrape(_job())
+
+    assert built["storage_state"] == {"cookies": saved["cookies"], "origins": saved["origins"]}
+    after = json.loads((tmp_path / f"{EMAIL}.json").read_text())
+    assert after["origins"][0]["localStorage"][0]["value"] == "token-2", "the renewed token is kept"
+    assert after["password_login_at"] == saved["password_login_at"]

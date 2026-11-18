@@ -1,10 +1,13 @@
 import asyncio
 import base64
 import hashlib
+import logging
 import uuid
 from datetime import date
 
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page
+
+logger = logging.getLogger(__name__)
 
 
 def proxy_password(proxy_pass: str, proxy_country: str, sticky_key: str | None,
@@ -89,8 +92,13 @@ async def create_browser(
     proxy_pass: str,
     proxy_country: str = "DE",
     sticky_key: str | None = None,
+    storage_state: dict | None = None,
 ) -> tuple[Browser, BrowserContext, Page]:
-    """Launch a stealth Patchright browser with IPRoyal residential proxy."""
+    """Launch a stealth Patchright browser with IPRoyal residential proxy.
+
+    `storage_state` is a saved login (scraper.auth.load_login): the browser
+    starts with its cookies AND the sites' localStorage, where StepStone's app
+    keeps its own renewable login."""
     p = await async_playwright().start()
 
     browser = await p.chromium.launch(
@@ -103,20 +111,29 @@ async def create_browser(
     try:
         forwarder = await _start_proxy_forwarder(proxy_host, proxy_port, proxy_user, composed_pass)
         browser._stepstone_forwarder = forwarder
-        context, page = await _open_context(browser, forwarder.sockets[0].getsockname()[1])
+        context, page = await _open_context(browser, forwarder.sockets[0].getsockname()[1], storage_state)
     except Exception:
         await close_browser(browser)
         raise
     return browser, context, page
 
 
-async def _open_context(browser, forwarder_port):
-    context = await browser.new_context(
+async def _open_context(browser, forwarder_port, storage_state=None):
+    options = dict(
         viewport={"width": 1920, "height": 1080},
         locale="de-DE",
         timezone_id="Europe/Berlin",
         proxy={"server": f"http://127.0.0.1:{forwarder_port}"},
     )
+    context = None
+    if storage_state:
+        try:
+            context = await browser.new_context(**options, storage_state=storage_state)
+        except Exception as e:
+            # A damaged saved login costs at most a fresh login, never the job.
+            logger.warning(f"The browser refused the saved login ({type(e).__name__}); starting without it")
+    if context is None:
+        context = await browser.new_context(**options)
 
     page = await context.new_page()
     page.set_default_navigation_timeout(120_000)

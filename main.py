@@ -13,7 +13,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from models.candidate import CandidateResult, ScrapeResult
 from models.config import Settings
 from models.job import JobInput
-from scraper.auth import AuthenticationError, authenticate, save_session
+from scraper.auth import AuthenticationError, authenticate, load_login, save_login
 from scraper.browser import close_browser, create_browser
 from scraper.dedup import check_duplicate
 from scraper.talent_unlock import UnlockError, unlock_talent
@@ -364,6 +364,7 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
             proxy_pass=settings.proxy_pass,
             proxy_country=settings.proxy_country,
             sticky_key=account["email"],
+            storage_state=load_login(account["email"]),
         )
 
         # 2. Authenticate
@@ -1005,10 +1006,11 @@ async def run_scrape(job: JobInput) -> ScrapeResult:
         current_status["error"] = str(e)
     finally:
         if context is not None and authenticated_email:
-            # Cookies rotate during a job; the next job must start from the
-            # newest ones, or it may find the session dead and type the password.
+            # The app renews its login token during a job and the old one works
+            # only once; the next job must start from the newest login, or it
+            # may find the session dead and type the password.
             try:
-                save_session(authenticated_email, await asyncio.wait_for(context.cookies(), 20))
+                await asyncio.wait_for(save_login(authenticated_email, context), 20)
             except Exception as e:
                 logger.warning(f"Could not save the session after the job: {type(e).__name__}")
         if browser:

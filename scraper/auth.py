@@ -38,6 +38,7 @@ import logging
 import os
 import random
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from patchright.async_api import BrowserContext, Page
@@ -57,6 +58,8 @@ EMAIL_INPUT = "input[name='email']"
 PASSWORD_INPUT = "input[name='password']"
 SUBMIT_BUTTON = "form button[type='submit']"
 CAPTCHA_CONTAINER = ".captcha-container"
+# The login host's device-id cookies (Auth0). Kept across a fresh login.
+DEVICE_COOKIES = frozenset({"did", "did_compat"})
 
 # Tealium consent banner on the app host. We DECLINE non-essential cookies:
 # "Einstellungen oder ablehnen" opens the preferences, "Speichern und Beenden"
@@ -154,35 +157,132 @@ class AuthenticationError(Exception):
 
 # ----------------------------------------------------------------- sessions
 
+# A saved login is the browser's WHOLE login, as Playwright stores it: the
+# cookies AND each site's localStorage, plus when the password was last typed.
+#   {"cookies": [...], "origins": [{"origin": ..., "localStorage": [...]}],
+#    "password_login_at": "2026-11-18T05:12:46+00:00"}
+# Until Nov 2026 only the cookies were saved (a plain list; such files still
+# load). That was the weekly password login: the app keeps its own login, a
+# token it renews at the login host's /oauth/token, in localStorage
+# (auth0-spa-js with refresh tokens, seen in a person's browser 2026-09-25).
+# Without it every job got in through StepStone's login session cookie
+# instead, which ends about a week after the password was typed, however
+# often it is used (Nov 4 -> still fine Nov 11 -> gone Nov 13).
+
 def _session_path(email: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9]", "_", email)
     return os.path.join(SESSIONS_DIR, f"{safe}.json")
 
 
-def _load_session(path: str) -> list[dict] | None:
+def _load_state(path: str) -> dict | None:
+    """The saved login as {"cookies", "origins", "password_login_at"}, or None."""
     if not os.path.exists(path):
         return None
     try:
         with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
+            data = json.load(f)
+    except (ValueError, IOError):
         return None
+    if isinstance(data, list):  # saved before Nov 2026: cookies only
+        return {"cookies": data, "origins": [], "password_login_at": None}
+    if not isinstance(data, dict) or not isinstance(data.get("cookies"), list):
+        return None
+    origins = [o for o in data.get("origins") or []
+               if isinstance(o, dict) and isinstance(o.get("origin"), str)
+               and isinstance(o.get("localStorage"), list)]
+    at = data.get("password_login_at")
+    return {"cookies": data["cookies"], "origins": origins,
+            "password_login_at": at if isinstance(at, str) else None}
 
 
-def save_session(email: str, cookies: list[dict]) -> None:
-    """Store the account's current cookies (called again after every job)."""
-    if cookies:
-        _save_session(_session_path(email), cookies)
+def load_login(email: str) -> dict | None:
+    """The account's saved login as Playwright storage state, ready for
+    new_context(storage_state=...), or None when there is none."""
+    state = _load_state(_session_path(email))
+    return {"cookies": state["cookies"], "origins": state["origins"]} if state else None
 
 
-def _save_session(path: str, cookies: list[dict]) -> None:
+def _save_state(path: str, state: dict, password_login_at: str | None = None) -> None:
+    """Save the browser's login. Without `password_login_at` (a reuse, the end
+    of a job) the saved time of the last password login is kept."""
+    if not state.get("cookies"):
+        return
+    if password_login_at is None:
+        password_login_at = (_load_state(path) or {}).get("password_login_at")
+    data = {"cookies": state["cookies"], "origins": state.get("origins") or [],
+            "password_login_at": password_login_at}
     # Atomic: a redeploy (SIGTERM) mid-write must not leave half a file, which
     # would read as "no session" and cost a password login.
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(cookies, f)
+        json.dump(data, f)
     os.replace(tmp, path)
+
+
+async def save_login(email: str, context: BrowserContext) -> None:
+    """Store the account's whole current login (called again after every job:
+    the app renews its token during a job, and the old one works only once)."""
+    _save_state(_session_path(email), await context.storage_state())
+
+
+SAVE_TIMEOUT_S = 20
+
+
+async def _save_login_now(context: BrowserContext, path: str, password_login_at: str | None = None,
+                          drop_app_login: bool = False) -> dict | None:
+    """Save the browser's login, best effort: a save that fails or hangs must
+    never fail a login that worked. Returns what was saved, or None."""
+    try:
+        state = await asyncio.wait_for(context.storage_state(), SAVE_TIMEOUT_S)
+        if drop_app_login:
+            state = {"cookies": state.get("cookies") or [], "origins": []}
+        _save_state(path, state, password_login_at)
+        return state
+    except Exception as e:
+        logger.warning(f"Could not save the login ({type(e).__name__})")
+    if password_login_at is not None:
+        # A password was just typed: keep at least its cookies, or the next
+        # job types it again. The app's stored login follows on the next save.
+        try:
+            cookies = await asyncio.wait_for(context.cookies(), SAVE_TIMEOUT_S)
+            _save_state(path, {"cookies": cookies, "origins": []}, password_login_at)
+        except Exception as e:
+            logger.warning(f"Could not save the new login's cookies either ({type(e).__name__})")
+    return None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _login_age(password_login_at: str | None) -> str:
+    try:
+        typed = datetime.fromisoformat(password_login_at)
+    except (TypeError, ValueError):
+        return "password login time unknown"
+    days = (datetime.now(timezone.utc) - typed).total_seconds() / 86400
+    return f"password last typed {days:.1f} days ago"
+
+
+def _stored_login(state: dict) -> str:
+    """Whether the app's own renewable login is in the saved state, said
+    without a single token value. offline_access matters: such a token does
+    not end with StepStone's login session (Auth0's online_access would)."""
+    for origin in state.get("origins") or []:
+        if _host(origin.get("origin", "")) != APP_HOST:
+            continue
+        for item in origin.get("localStorage") or []:
+            if not str(item.get("name", "")).startswith("@@auth0spajs@@"):
+                continue
+            try:
+                body = (json.loads(item.get("value") or "") or {}).get("body") or {}
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(body, dict) and body.get("refresh_token"):
+                offline = "offline_access" in str(body.get("scope") or "").split()
+                return f"app login stored, renewable: yes, offline_access: {'yes' if offline else 'no'}"
+    return "app login stored, renewable: no"
 
 
 # ------------------------------------------------------------------ helpers
@@ -287,8 +387,21 @@ class _SessionProof:
         # site (2026-09-25) that detour cost the login page its time budget.
         self.nudge = True
         self.failed_requests: list[str] = []
+        self.used_login_session = False
+        self.renewals: list[int] = []   # status of each renewal of the app's stored login
+        page.on("request", self._on_request)
         page.on("response", self._on_response)
         page.on("requestfailed", self._on_request_failed)
+
+    def _on_request(self, request) -> None:
+        # A visit to /authorize (a redirect or the app's hidden iframe) means
+        # StepStone's week-long login session got us in.
+        try:
+            p = urlparse(request.url)
+            if (p.hostname or "").lower() == LOGIN_HOST and p.path.startswith("/authorize"):
+                self.used_login_session = True
+        except Exception:
+            pass
 
     async def _on_response(self, response) -> None:
         # Our own fetch hits the same URL. It is reported by _fetch_credits, so
@@ -296,6 +409,13 @@ class _SessionProof:
         # XHR; we use fetch). A balance is proof whoever asked for it.
         try:
             p = urlparse(response.url)
+            if (p.hostname or "").lower() == LOGIN_HOST and p.path.startswith("/oauth/token"):
+                # The app renewing its stored login. The body carries the token:
+                # it is only searched for the grant type, never kept or logged.
+                body = (response.request.post_data or "").replace(" ", "")
+                if "grant_type=refresh_token" in body or '"grant_type":"refresh_token"' in body:
+                    self.renewals.append(response.status)
+                return
             if (p.hostname or "").lower() != APP_HOST or p.path != CREDITS_PATH:
                 return
             ours = self._own_fetch_in_flight and response.request.resource_type == "fetch"
@@ -320,7 +440,8 @@ class _SessionProof:
             pass
 
     def detach(self) -> None:
-        for event, handler in (("response", self._on_response),
+        for event, handler in (("request", self._on_request),
+                               ("response", self._on_response),
                                ("requestfailed", self._on_request_failed)):
             try:
                 self.page.remove_listener(event, handler)
@@ -358,9 +479,23 @@ class _SessionProof:
             logger.info(f"In the app without a balance yet: opened Talent Finder ({self.talent_finder})")
         return self.credits
 
+    def route(self) -> str:
+        """How a reuse got in, from what was seen (not inferred from silence)."""
+        if self.used_login_session:
+            return "through StepStone's login session"
+        if 200 in self.renewals:
+            return "through the app's stored login"
+        return "no login request seen"
+
+    def app_login_refused(self) -> bool:
+        """StepStone refused the app's stored login (Auth0 answers invalid_grant
+        with a 4xx): a used or revoked token, which no later job can use."""
+        return any(400 <= s < 500 for s in self.renewals)
+
     def describe(self) -> str:
         return (f"credits proof: app's own call={self.app_call}, our fetch={self.own_fetch}, "
-                f"talent finder={self.talent_finder}; failed requests: "
+                f"talent finder={self.talent_finder}; app login renewals: "
+                f"{', '.join(map(str, self.renewals)) or 'none'}; failed requests: "
                 f"{', '.join(self.failed_requests) or 'none'}")
 
 
@@ -510,13 +645,40 @@ async def _await_outcome(page: Page, proof: _SessionProof, email: str) -> dict:
     )
 
 
+async def _forget_app_login(context: BrowserContext, page: Page) -> None:
+    """Drop the app's own stored login (localStorage), like the cookies before
+    it: left in, the app would renew THAT login while another account types
+    its password, and the job would spend the wrong account's credits."""
+    try:
+        cdp = await context.new_cdp_session(page)
+        try:
+            for host in (APP_HOST, LOGIN_HOST):
+                await cdp.send("Storage.clearDataForOrigin",
+                               {"origin": f"https://{host}", "storageTypes": "local_storage"})
+        finally:
+            await cdp.detach()
+    except Exception as e:
+        logger.warning(f"Could not clear the app's stored login before a fresh login ({type(e).__name__})")
+
+
 async def _fresh_login(context: BrowserContext, page: Page, proof: _SessionProof,
                        email: str, password: str) -> dict:
-    # Discard every cookie FIRST (lesson of 2026-08-03). A session we just
-    # judged unusable may still be half-valid, and main.py retries the OTHER
-    # account on this same context: without a clean jar, account 1's cookies
-    # would ride along into account 2's login.
+    # Discard every session cookie FIRST (lesson of 2026-08-03). A session we
+    # just judged unusable may still be half-valid, and main.py retries the
+    # OTHER account on this same context: without a clean jar, account 1's
+    # cookies would ride along into account 2's login.
+    # Except the login host's device id ("did"): it names the browser, not an
+    # account or a session, and a normal browser keeps it for a year. Dropping
+    # it made every fresh login look like a brand-new device.
+    device = [c for c in await context.cookies()
+              if c.get("name") in DEVICE_COOKIES and (c.get("domain") or "").lstrip(".") == LOGIN_HOST]
     await context.clear_cookies()
+    if device:
+        try:
+            await context.add_cookies(device)
+        except Exception as e:
+            logger.warning(f"Could not keep the login page's device cookie ({type(e).__name__})")
+    await _forget_app_login(context, page)
     await page.goto(APP_URL, wait_until="domcontentloaded")
     proof.nudge = False
     try:
@@ -571,8 +733,14 @@ async def authenticate(
 async def _authenticate(context: BrowserContext, page: Page, proof: _SessionProof,
                         email: str, password: str) -> dict:
     session_file = _session_path(email)
-    saved_cookies = _load_session(session_file)
+    saved = _load_state(session_file)
+    saved_cookies = saved["cookies"] if saved else None
     if saved_cookies:
+        # The job built its browser from the whole saved login already
+        # (create_browser(storage_state=load_login(email)): cookies and the
+        # app's localStorage). Adding the same cookies again changes nothing,
+        # and covers a browser built without it: the second-account fallback,
+        # or a saved login the browser refused.
         try:
             await context.add_cookies(saved_cookies)
         except Exception as e:
@@ -592,9 +760,21 @@ async def _authenticate(context: BrowserContext, page: Page, proof: _SessionProo
             state, credits = "error", None
             logger.warning(f"Restoring the saved session for {email} failed: {type(e).__name__}: {e}")
         if state == "app":
-            _save_session(session_file, await context.cookies())  # keep rotated cookies
-            logger.info(f"Reused saved Stepstone Recruit session for {email} ({_balance(credits)})")
+            login = await _save_login_now(context, session_file)  # the renewed token: the old one works once
+            logger.info(f"Reused saved Stepstone Recruit session for {email} ({_balance(credits)}; "
+                        f"{proof.route()}; {_login_age(saved['password_login_at'])}; "
+                        f"{_stored_login(login or {})})")
             return credits
+        if state != "login_form":
+            # No login here, but the browser may already hold a renewed token
+            # (the app renews as soon as it loads) while the file holds the used
+            # one. Save it, or the next job sends the used token and StepStone
+            # cancels the whole chain. A token StepStone refused is dropped
+            # instead: loaded into every later job, it could stall them all.
+            if proof.app_login_refused():
+                logger.warning(f"StepStone refused the app's stored login for {email}; dropped it "
+                               f"(the next job uses the cookies alone)")
+            await _save_login_now(context, session_file, drop_app_login=proof.app_login_refused())
         if state == "blocked":
             raise AuthenticationError(
                 f"StepStone's edge blocked the app for {email} while restoring the session. "
@@ -622,6 +802,6 @@ async def _authenticate(context: BrowserContext, page: Page, proof: _SessionProo
         proof._on_app_since = None
 
     credits = await _fresh_login(context, page, proof, email, password)
-    _save_session(session_file, await context.cookies())
-    logger.info(f"Logged in to Stepstone Recruit as {email} ({_balance(credits)})")
+    login = await _save_login_now(context, session_file, password_login_at=_now_iso())
+    logger.info(f"Logged in to Stepstone Recruit as {email} ({_balance(credits)}; {_stored_login(login or {})})")
     return credits

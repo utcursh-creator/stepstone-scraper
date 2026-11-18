@@ -99,3 +99,32 @@ def test_a_plain_http_request_closes_so_the_next_one_also_gets_the_login():
                     b"Proxy-Authorization: Basic bG9naW4=\r\n"
                     b"Connection: close\r\n"
                     b"Host: example.test\r\n\r\n")
+
+
+async def test_a_saved_login_the_browser_refuses_does_not_stop_the_job():
+    """A damaged saved login must cost at most a fresh login, never the job."""
+    from scraper.browser import _open_context
+
+    class Browser:
+        def __init__(self):
+            self.calls = []
+
+        async def new_context(self, **kw):
+            self.calls.append(kw)
+            if "storage_state" in kw:
+                raise ValueError("cookies[0].expires: expected number")
+            return Ctx()
+
+    class Ctx:
+        async def new_page(self):
+            return Page()
+
+    class Page:
+        def set_default_navigation_timeout(self, ms):
+            pass
+
+    browser = Browser()
+    await _open_context(browser, 1234, {"cookies": [{"name": "x"}], "origins": []})
+
+    assert "storage_state" in browser.calls[0] and "storage_state" not in browser.calls[1]
+    assert browser.calls[1]["proxy"] == {"server": "http://127.0.0.1:1234"}
