@@ -183,6 +183,7 @@ class FakeStepstone:
         self.redirect_delay_ms = 300    # unauthenticated app -> login page
         self.login_render_delay_ms = 0  # login page loaded -> its form shows
         self.login_blank_loads = 0      # this many login page loads never show the form
+        self.app_tunnel_failures = 0    # this many app page loads fail like a dead proxy tunnel
         self.tf_broken = False          # Talent Finder shows its error page, never loads the balance
         self.search_requests = []
         self.search_total = 27
@@ -200,6 +201,9 @@ class FakeStepstone:
         path = "/" + url.split("/", 3)[3] if url.count("/") >= 3 else "/"
         self.hits.append((host, path.split("?")[0]))
         if host == "recruit.stepstone.com":
+            if self.app_tunnel_failures > 0 and req.is_navigation_request():
+                self.app_tunnel_failures -= 1
+                return await route.abort("connectionfailed")
             if self.scenario == "blocked":
                 return await route.fulfill(status=403, content_type="text/html", body=BLOCK_HTML)
             if path.startswith("/recruiter/talent-sourcing/api/v1/autosuggestion/locations"):
@@ -860,3 +864,33 @@ async def test_a_job_starts_from_the_saved_login_and_saves_it_again(monkeypatch,
     after = json.loads((tmp_path / f"{EMAIL}.json").read_text())
     assert after["origins"][0]["localStorage"][0]["value"] == "token-2", "the renewed token is kept"
     assert after["password_login_at"] == saved["password_login_at"]
+
+
+async def test_a_failed_proxy_connection_is_tried_again_before_the_job_is_skipped(site, monkeypatch):
+    """Live, 2026-11-25: 2 of 11 jobs lost to net::ERR_TUNNEL_CONNECTION_FAILED
+    opening the app, and the next job worked seconds later. A dead tunnel is
+    the connection, not the login: wait, try again."""
+    fake, context, page, tmp = site
+    monkeypatch.setattr(auth_mod, "GOTO_RETRY_WAITS_S", (0.1, 0.1))
+    (tmp / f"{EMAIL}.json").write_text(json.dumps([
+        _cookie("tf_session", "session-for-recruiter"), _cookie("consent_level", "essential")]))
+    fake.app_tunnel_failures = 2
+
+    credits = await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert credits["remainingCredits"] == 147
+    assert not fake.login_page_hits(), "still the saved login: no password for a connection problem"
+
+
+async def test_a_connection_that_stays_down_skips_the_job_without_a_password(site, monkeypatch):
+    fake, context, page, tmp = site
+    monkeypatch.setattr(auth_mod, "GOTO_RETRY_WAITS_S", (0.1, 0.1))
+    (tmp / f"{EMAIL}.json").write_text(json.dumps([
+        _cookie("tf_session", "session-for-recruiter"), _cookie("consent_level", "essential")]))
+    fake.app_tunnel_failures = 3
+
+    with pytest.raises(AuthenticationError) as err:
+        await authenticate(context, page, EMAIL, PASSWORD)
+
+    assert err.value.code == "SESSION_REUSE_TIMEOUT"
+    assert not fake.login_page_hits()

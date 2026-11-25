@@ -645,6 +645,28 @@ async def _await_outcome(page: Page, proof: _SessionProof, email: str) -> dict:
     )
 
 
+GOTO_RETRY_WAITS_S = (5, 15)  # a connection that failed: wait this long, then open the app again
+_NET_ERROR_RE = re.compile(r"net::ERR_[A-Z_]+")
+
+
+async def _open_app(page: Page) -> None:
+    """Open the app, trying again when the connection itself failed. Live,
+    2026-11-25: 2 of 11 jobs lost to net::ERR_TUNNEL_CONNECTION_FAILED (the
+    proxy did not connect), and the next job worked seconds later. That is the
+    connection, not the login: no reason to skip the job, and never a reason
+    to type the password."""
+    for wait_s in (*GOTO_RETRY_WAITS_S, None):
+        try:
+            await page.goto(APP_URL, wait_until="domcontentloaded")
+            return
+        except Exception as e:
+            net = _NET_ERROR_RE.search(str(e))
+            if wait_s is None or not net:
+                raise
+            logger.warning(f"Opening StepStone failed ({net.group(0)}); trying again in {wait_s}s")
+            await asyncio.sleep(wait_s)
+
+
 async def _forget_app_login(context: BrowserContext, page: Page) -> None:
     """Drop the app's own stored login (localStorage), like the cookies before
     it: left in, the app would renew THAT login while another account types
@@ -679,7 +701,7 @@ async def _fresh_login(context: BrowserContext, page: Page, proof: _SessionProof
         except Exception as e:
             logger.warning(f"Could not keep the login page's device cookie ({type(e).__name__})")
     await _forget_app_login(context, page)
-    await page.goto(APP_URL, wait_until="domcontentloaded")
+    await _open_app(page)
     proof.nudge = False
     try:
         state, credits = await _await_landing(page, proof, LANDING_TIMEOUT_S)
@@ -754,7 +776,7 @@ async def _authenticate(context: BrowserContext, page: Page, proof: _SessionProo
             saved_cookies = None
     if saved_cookies:
         try:
-            await page.goto(APP_URL, wait_until="domcontentloaded")
+            await _open_app(page)
             state, credits = await _await_landing(page, proof, SESSION_REUSE_TIMEOUT_S)
         except Exception as e:
             state, credits = "error", None
